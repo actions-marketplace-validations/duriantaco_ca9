@@ -5,7 +5,11 @@ description: Complete ca9 CLI reference for Python CVE reachability analysis, pa
 
 # CLI Reference
 
-ca9 provides reachability-aware CVE triage and local Python package security checks. The core commands are `check` for existing SCA reports, `scan` for direct OSV.dev scanning, `inventory` for normalized package evidence, `vet` for supply-chain risk checks, and `ingest-sarif` for normalizing static-analysis evidence from other tools.
+ca9 provides reachability-aware CVE triage and local package security checks. The core
+commands are `check` for existing SCA reports, `scan` for direct OSV.dev scanning,
+`inventory` for normalized package evidence, `vet` for supply-chain risk checks, `feed`
+for local package-intelligence snapshots, `run` for supported npm/pip install
+preflight, and `ingest-sarif` for normalizing static-analysis evidence from other tools.
 
 ## Global options
 
@@ -33,6 +37,8 @@ Supported input reports are auto-detected:
 - Snyk JSON
 - Dependabot alerts JSON
 - Trivy JSON
+- Grype JSON
+- OSV-Scanner JSON
 - pip-audit JSON
 
 Common options:
@@ -125,6 +131,42 @@ ca9 inventory --repo .
 ca9 inventory --repo . -f json -o ca9-inventory.json
 ```
 
+## `ca9 protect`
+
+Report whether the repository's dependency-install workflows are protected.
+The command is local and read-only.
+
+```bash
+ca9 protect [PATH] [OPTIONS]
+```
+
+Options:
+
+| Option | Description |
+|---|---|
+| `-r, --repo PATH` | Project repository path. Defaults to `.`. |
+| `-f, --format table\|json\|markdown\|sarif` | Output format. Defaults to `table`. |
+| `-o, --output PATH` | Write output to a file. |
+| `--policy PATH` | ca9 package policy TOML. |
+| `--scan-workflows / --no-scan-workflows` | Include local GitHub Actions trust-boundary checks. Enabled by default. |
+
+`protect` detects npm, pip, uv, Poetry, Pipenv, PDM, pnpm, Yarn, fyn, and
+PEP 751 lock workflows. It validates the npm v2/v3 and local pip requirements
+workflows that `ca9 run` can currently enforce, reports other managers without
+pretending to mediate them, and combines feed state, exception hygiene,
+inventory, package-policy findings, and workflow decisions in
+`ca9.protect.v1`. Blocking posture or policy decisions exit `1`; warnings exit
+`0`.
+
+Examples:
+
+```bash
+ca9 protect --repo .
+ca9 protect --repo . -f json -o ca9-protect.json
+ca9 protect --repo . -f sarif -o ca9-protect.sarif
+ca9 protect --repo . --no-scan-workflows
+```
+
 ## `ca9 vet`
 
 Run package supply-chain risk checks.
@@ -140,6 +182,7 @@ Options:
 | `-r, --repo PATH` | Project repository path. Defaults to `.`. |
 | `-f, --format table\|json` | Output format. Defaults to `table`. |
 | `-o, --output PATH` | Write output to a file. |
+| `--policy PATH` | ca9 package policy TOML. |
 | `--trusted-index URL` | Trusted package index. Can be repeated. Defaults to PyPI and npmjs. |
 | `--private-index URL` | Private package index allowed for internal package names. Can be repeated. |
 | `--internal-package PATTERN` | Internal package name or glob pattern, e.g. `acme-*`. Can be repeated. |
@@ -165,7 +208,130 @@ ca9 vet --repo . --internal-package 'acme-*' --private-index https://packages.ac
 ca9 vet --repo . --deny-license AGPL-3.0 --deny-license GPL-3.0
 ```
 
-See [Supply-Chain Vetting](supply-chain.md) for details on current findings and limits.
+`vet` uses an installed `ca9.feed.v1` feed for local malware and package-age decisions
+when policy enables those checks. `--malware-query` is an additional OSV query path, not
+the feed path. See [Supply-Chain Vetting](supply-chain.md) for details on current
+findings and limits.
+
+## `ca9 policy`
+
+Validate or explain the effective package policy.
+
+```bash
+ca9 policy validate [OPTIONS]
+ca9 policy explain [OPTIONS]
+```
+
+Options:
+
+| Option | Description |
+|---|---|
+| `--policy PATH` | ca9 package policy TOML. |
+| `-f, --format table\|json` | Output format for `explain`. Defaults to `table`. |
+
+Examples:
+
+```bash
+ca9 policy validate --policy ca9.toml
+ca9 policy explain --policy ca9.toml
+```
+
+Top-level `[[exceptions]]` entries can downgrade a matching policy decision to
+`warn` or `pass`. Each entry requires `policy_id`, `owner`, `reason`, and an ISO
+`expires` date; optional `ecosystem`, `package`, and `version` selectors narrow
+the scope. Applied entries are included in decision evidence, expired entries
+do not match, and `ca9.malware` cannot be overridden.
+
+## `ca9 feed`
+
+Manage local package-intelligence feed snapshots.
+
+```bash
+ca9 feed update [OPTIONS]
+ca9 feed status [OPTIONS]
+```
+
+Options:
+
+| Option | Description |
+|---|---|
+| `--from PATH_OR_URL` | Feed bundle URL, JSON file, or directory containing `snapshot.json`. Optional for `update`. |
+| `--policy PATH` | ca9 package policy TOML for `status` offline/stale behavior. |
+| `-f, --format table\|json` | Output format. Defaults to `table`. |
+
+`ca9 feed update` resolves the source in this order: `--from`, `CA9_FEED_URL`, then the
+built-in default feed URL on the project's published `feed` branch. Use `--from` or
+`CA9_FEED_URL` to select a local or alternate hosted bundle.
+
+Feed bundles use schema `ca9.feed.v1` with `npm-malware`, `pypi-malware`,
+`npm-releases`, and `pypi-releases`. ca9 stores snapshots under `~/.cache/ca9/feed/` and
+verifies per-dataset SHA-256 hashes before use.
+
+Examples:
+
+```bash
+ca9 feed update
+ca9 feed update --from ./ca9-feed.json
+ca9 feed status --policy ca9.toml -f json
+```
+
+## `ca9 run`
+
+Preflight and run supported package-manager install commands.
+
+```bash
+ca9 run [OPTIONS] -- COMMAND
+```
+
+Supported command families:
+
+- `npm ci` and its clean-install aliases
+- `npm install <direct package spec>`
+- `npm i <direct package spec>`
+- `pip install <direct package spec>`
+- `python -m pip install <direct package spec>`
+- `pip install -r <local requirements file> [-c <local constraints file>]`
+
+Options:
+
+| Option | Description |
+|---|---|
+| `--policy PATH` | ca9 package policy TOML. |
+| `--dry-run` | Run preflight only; do not execute the child command. |
+| `--audit-log PATH` | Runtime audit JSONL path. Defaults to `~/.cache/ca9/audit.jsonl`. |
+| `-f, --format table\|json` | Output format. Use `--dry-run` with JSON pass decisions. |
+
+`run` checks registry policy, local feed malware, package-age policy, install scripts with
+secret-bearing environment variables, and unsupported sources before executing the child
+command. When a feed is available, npm and PyPI loopback gateways can hide denied
+versions or links from the package manager and record those gateway decisions in the
+runtime audit log.
+
+For `npm ci` and its aliases, every exact non-project package in
+`package-lock.json` is checked, including transitives. Missing, unreadable, or
+unsupported lockfiles block before npm starts. Lockfile versions 2 and 3 are
+supported; `npm-shrinkwrap.json` is not yet supported. Zero-argument `npm install` /
+`npm i` is intentionally unsupported because npm may update an out-of-sync lockfile;
+use `npm ci` when ca9 must prove the installed set matches the checked lock.
+
+Requirement and constraint includes resolve relative to the containing file and
+must stay inside the repository. ca9 supports nested local includes, hashes,
+markers, index evidence, and constraints that refine declared requirements.
+Remote requirement files, direct/editable/local dependencies, extra indexes,
+find-links, include cycles, and escaping paths block before pip starts. When the
+PyPI gateway is active, its loopback URL is appended as the final pip index
+option so an index declared inside a requirements file cannot bypass mediation.
+
+Examples:
+
+```bash
+ca9 run --dry-run -- npm ci
+ca9 run --dry-run -- npm install express@4.18.2
+ca9 run -- npm i @scope/pkg@1.2.3
+ca9 run -- python -m pip install requests==2.31.0
+ca9 run -- pip install requests==2.31.0
+ca9 run -- pip install -r requirements.txt -c constraints.txt
+```
 
 ## `ca9 ingest-sarif`
 

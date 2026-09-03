@@ -33,7 +33,7 @@ ca9 scan --coverage coverage.json
 
 ## Option B: Analyze an existing SCA report
 
-If you already have a Snyk, Dependabot, Trivy, or pip-audit report:
+If you already have a Snyk, Dependabot, Trivy, Grype, OSV-Scanner, or pip-audit report:
 
 === "Snyk"
 
@@ -62,6 +62,20 @@ If you already have a Snyk, Dependabot, Trivy, or pip-audit report:
     ca9 check trivy.json
     ```
 
+=== "Grype"
+
+    ```bash
+    grype dir:. --output json > grype.json
+    ca9 check grype.json --repo .
+    ```
+
+=== "OSV-Scanner"
+
+    ```bash
+    osv-scanner scan --format json . > osv-scanner.json
+    ca9 check osv-scanner.json --repo .
+    ```
+
 === "pip-audit"
 
     ```bash
@@ -70,6 +84,17 @@ If you already have a Snyk, Dependabot, Trivy, or pip-audit report:
     ```
 
 ## Option C: Inspect package inventory and supply-chain risk
+
+Start with one read-only posture check:
+
+```bash
+ca9 protect --repo .
+```
+
+This reports which dependency workflows ca9 can enforce, whether the local
+package feed and policy exceptions are healthy, and whether package or GitHub
+Actions findings block the repository. Use `-f json`, `-f markdown`, or
+`-f sarif` for CI artifacts.
 
 Use `inventory` to see what ca9 knows about packages, artifact hashes, and dependency
 edges:

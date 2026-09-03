@@ -4,7 +4,7 @@
 
 <h1 align="center">ca9</h1>
 
-<p align="center"><strong>Local, evidence-backed security for Python packages and SCA alerts.</strong></p>
+<p align="center"><strong>Local, evidence-backed supply-chain defense for open-source packages.</strong></p>
 
 <p align="center">
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+"></a>
@@ -16,6 +16,51 @@
 
 ---
 
+## What You Get
+
+ca9 tells you whether your dependency supply chain is safe enough to ship, and
+helps stop unsafe packages before they run.
+
+Use it when you want to:
+
+- **Know what you have:** build a local package inventory from manifests,
+  lockfiles, artifacts, SBOM inputs, and declared dependency evidence.
+- **Know what is risky:** flag malicious packages, vulnerable packages,
+  unreachable/noisy CVEs, untrusted registries, dependency-confusion risk,
+  missing hashes, suspicious artifacts, bad licenses, Git/URL dependencies, and
+  install-script risk.
+- **Know what to do:** get evidence-backed decisions such as block, warn,
+  investigate, suppress, upgrade, remove, pin, rotate credentials, or verify
+  manually.
+- **Prevent risky installs:** enforce package policy in CI or local installs so
+  known malware, untrusted registries, and secret-exposing install scripts can
+  be stopped before package code executes. `ca9 run` supports lockfile-backed
+  `npm ci`, local pip requirements/constraints files, and explicit npm/pip
+  package specs.
+
+The core commands are meant to be plain:
+
+```bash
+ca9 vet .
+ca9 protect .
+ca9 scan --repo .
+ca9 inventory --repo . -f json
+ca9 feed status
+ca9 run -- npm ci
+```
+
+Runtime preflight uses the same package evidence and policy:
+
+```bash
+ca9 run -- npm ci
+ca9 run -- pip install -r requirements.txt
+ca9 run -- npm install <package>
+ca9 run -- python -m pip install <package>
+```
+
+Skylos answers "is this repo, PR, or code change risky?" ca9 answers "is this
+package supply chain risky, and should this dependency be allowed?"
+
 ## The problem
 
 Your SCA tool (Snyk, Dependabot, Trivy, pip-audit, OSV, or another scanner) flags every CVE in your dependency tree. You get 60 alerts. Your team scrambles. But many of those CVEs are in code your application **never imports, never calls, and never executes**.
@@ -26,11 +71,12 @@ That's wasted engineering time. That's alert fatigue. That's how real vulnerabil
 
 ## What ca9 does
 
-ca9 is a local-first security layer for Python packages and open-source dependency risk.
-Today, its strongest path turns CVE alerts into evidence-backed fix, suppress, or
-investigate decisions. The newer inventory path normalizes packages, artifacts, lockfile
-evidence, and dependency edges so ca9 can grow beyond CVE-only reachability without
-making any resolver or package manager a required dependency.
+ca9 is a local-first supply-chain defense layer for open-source packages. Today,
+its strongest path turns CVE alerts into evidence-backed fix, suppress, or
+investigate decisions. Its inventory and vetting path normalizes packages,
+artifacts, lockfile evidence, registries, licenses, malware advisories, and
+dependency edges so ca9 can grow beyond CVE-only reachability without making any
+resolver or package manager a required dependency.
 
 It takes your CVE list and answers one question per vulnerability: **is this code actually reachable from your application?**
 
@@ -39,8 +85,8 @@ pip install ca9[cli]
 ca9 scan --repo . --coverage coverage.json
 ```
 
-For package inventory and supply-chain evidence, ca9 can read project manifests natively
-and uses `fyn.lock` or npm `package-lock.json` when present:
+For package inventory and supply-chain evidence, ca9 can read project manifests
+natively and uses `fyn.lock` or npm `package-lock.json` when present:
 
 ```bash
 ca9 inventory --repo . -f json
@@ -95,20 +141,40 @@ ca9 is **conservative** — it only marks something unreachable when it can prov
 
 ## Where ca9 fits
 
-ca9 does not replace your SCA tool. It adds local, evidence-first reachability analysis to the vulnerability data you already have.
+ca9 does not replace every specialized scanner. It gives developers and security
+teams one local command surface for package supply-chain evidence, risk decisions,
+and audit outputs. Existing SCA tools can still provide advisory input; ca9 adds
+reachability, package inventory, artifact evidence, and policy decisions.
 
 | | ca9 | Alert-only SCA output | Hosted reachability platforms |
 |---|---|---|---|
 | **Local analysis** | Runs in your repo/CI | Varies | Often requires source upload or hosted project import |
 | **Direct OSV scan** | Yes — `ca9 scan` queries OSV.dev directly | Not always | Varies |
-| **SCA report parsing** | Snyk, Dependabot, Trivy, pip-audit | Native to each tool | Platform-specific |
-| **Package inventory** | Native manifests plus optional `fyn.lock` and npm `package-lock.json` artifacts and dependency edges | Varies | Varies |
+| **SCA report parsing** | Snyk, Dependabot, Trivy, Grype, OSV-Scanner, pip-audit | Native to each tool | Platform-specific |
+| **Package inventory** | Native manifests plus optional `fyn.lock` and npm `package-lock.json` artifacts, registries, and dependency edges | Varies | Varies |
+| **Supply-chain vetting** | Malware advisories, registry trust, artifact hashes, package age with local feeds, source-only risk, dependency confusion, workflow risk, and license policy | Varies | Varies |
+| **Protection posture** | One local `ca9 protect` report for install-workflow coverage, feed state, exception hygiene, package policy, and Actions trust boundaries | Varies | Varies |
 | **Static + dynamic evidence** | Imports, dependency graph, coverage, API usage | Usually package-level alerts | Varies by vendor and integration |
 | **Open outputs** | JSON, SARIF, OpenVEX, Markdown, HTML, remediation, action plan | Vendor-specific | Platform-specific |
 | **Confidence/evidence trail** | Structured evidence per verdict | Limited | Varies |
-| **Runtime dependencies** | `packaging` core dependency; optional CLI/MCP extras | Varies | Hosted service |
+| **Runtime prevention** | `ca9 run` preflight and scoped npm/PyPI metadata gateways for lockfile-backed npm installs, pip requirements/constraints, and direct npm/pip specs | Varies | Varies |
 
-**Use ca9 when you want an open, local Python reachability layer for CVE triage, CI gates, SARIF upload, OpenVEX generation, or SBOM enrichment.**
+**Use ca9 when you want an open, local package supply-chain defense layer for
+inventory, CVE triage, package vetting, CI gates, SARIF upload, OpenVEX
+generation, SBOM enrichment, and install-time enforcement for supported npm and
+pip workflows.**
+
+## Current capability snapshot
+
+| Surface | Current capability |
+|---|---|
+| CVE reachability | Parses Snyk, Dependabot, Trivy, Grype, OSV-Scanner, and pip-audit reports; scans OSV directly; combines static import evidence, dependency graph evidence, optional coverage, vulnerable API rules, threat intel, accepted risks, and baselines. Non-Python report findings remain explicitly inconclusive. |
+| Inventory | Reads Python manifests, `uv.lock`, `poetry.lock`, `Pipfile`, `fyn.lock`, and npm `package-lock.json`; preserves packages, versions, dependency edges, groups, registries, artifact URLs, hashes, and npm SRI integrity. |
+| Vetting | Gates untrusted registries, dependency confusion, missing hashes, direct URL/Git/mutable sources, local feed malware, optional OSV malware queries, package age, workflow risk, artifact code heuristics, and license policy. |
+| Protection posture | `ca9 protect` detects dependency workflows, validates enforceable npm locks and pip requirements, reports unsupported managers, feed readiness, expired exceptions, package-policy decisions, and local GitHub Actions risks in table, JSON, Markdown, or SARIF. |
+| Artifact analysis | Hash-verifies and safely unpacks Python wheels/sdists and npm tarballs; scans Python startup/install/import-time behavior and npm lifecycle, encoded execution, and credential exfiltration patterns without executing package code. |
+| Runtime prevention | Supports lockfile-backed `ca9 run -- npm ci`, local `-r` requirements and `-c` constraints, plus direct `npm install ...`, `npm i ...`, `pip install ...`, and `python -m pip install ...` specs; checks policy before execution; strips or blocks secrets; mediates npm/PyPI metadata through loopback gateways when a feed is available. |
+| Feeds and audit | Installs `ca9.feed.v1` package-intelligence bundles into `~/.cache/ca9/feed`; verifies snapshot hashes; records redacted runtime audit JSONL including preflight decisions, feed use, gateway use, denied versions/links, and child process exit. |
 
 ## Real-world results
 
@@ -169,6 +235,22 @@ hashes or integrity values, registries, and source evidence. If there is no lock
 falls back to native Python manifest readers for `pyproject.toml`, `requirements*.txt`,
 `Pipfile`, `uv.lock`, and `poetry.lock`.
 
+### Check whether dependency installs are protected
+
+```bash
+ca9 protect --repo .
+ca9 protect --repo . -f json -o ca9-protect.json
+ca9 protect --repo . -f sarif -o ca9-protect.sarif
+```
+
+`ca9 protect` is a read-only, local posture check. It detects package-manager
+workflows, validates npm v2/v3 locks and pip requirements/constraints entry
+points, reports which installs `ca9 run` can enforce, checks local feed readiness
+and exception expiry, evaluates package-policy findings, and scans local GitHub
+Actions workflows by default. Missing enforceable locks and blocking policy
+decisions exit `1`; unsupported managers and other review items are warnings.
+Use `--no-scan-workflows` when the report should cover dependency posture only.
+
 ### Run supply-chain risk checks
 
 ```bash
@@ -181,22 +263,241 @@ ca9 vet --repo . --deny-license AGPL-3.0 --deny-license GPL-3.0
 ```
 
 `ca9 vet` evaluates the normalized package inventory for local supply-chain risk signals:
-untrusted package indexes, missing artifact hashes, missing artifact metadata, source-only
-install risk, and mutable package sources. With `--malware-query`, ca9 also queries OSV
-for known malicious-package advisories such as `MAL-*`, `PYSEC-MAL-*`, and malware-labeled
-GHSA/OSV records across PyPI and npm. With `--scan-workflows`, ca9 checks GitHub Actions
-workflows for risky token scopes, OIDC write access, `pull_request_target` trust-boundary
-patterns, mutable action refs, cache trust boundaries, source-clone commands, encoded
-shell execution, cloud metadata probing, and broad credential-file harvest patterns.
-Direct dependencies from untrusted indexes, known malicious packages, and high-risk
-workflow patterns are blocking findings; weaker local signals are warnings or
-investigation items.
+untrusted package indexes, missing artifact hashes, missing artifact metadata,
+source-only install risk, mutable package sources, package-age policy, and known
+malware from the installed local feed. With `--malware-query`, ca9 also queries
+OSV for known malicious-package advisories such as `MAL-*`, `PYSEC-MAL-*`, and
+malware-labeled GHSA/OSV records across PyPI and npm. With `--scan-workflows`,
+ca9 checks GitHub Actions workflows for risky token scopes, OIDC write access,
+`pull_request_target` trust-boundary patterns, mutable action refs, cache trust
+boundaries, source-clone commands, encoded shell execution, cloud metadata
+probing, and broad credential-file harvest patterns. Direct dependencies from
+untrusted indexes, known malicious packages, too-new package versions, and
+high-risk workflow patterns are blocking findings; weaker local signals are
+warnings or investigation items.
 
-With `--scan-artifacts`, ca9 downloads only lockfile artifacts with hashes by default,
-verifies the hash, safely unpacks wheels/sdists without executing code, and runs
-GuardDog-style static heuristics for suspicious `.pth` startup execution, install-time
-`setup.py` execution, startup customization hooks, credential/network exfiltration,
-import-time risky behavior, silent process execution, and encoded payload execution.
+With `--scan-artifacts`, ca9 downloads only lockfile artifacts with hashes by
+default, verifies the hash, safely unpacks Python wheels/sdists and npm tarballs
+without executing code, and runs GuardDog-style static heuristics for suspicious
+`.pth` startup execution, install-time `setup.py` execution, startup
+customization hooks, credential/network exfiltration, import-time risky
+behavior, silent process execution, encoded payload execution, npm lifecycle
+script execution, npm encoded execution, and npm credential exfiltration.
+
+### Configure package policy
+
+Use `ca9.toml` when a project needs explicit supply-chain policy:
+
+```toml
+[mode]
+default = "block" # off, warn, block, strict
+offline = "warn"
+
+[registries]
+allow = ["registry.npmjs.org", "pypi.org", "files.pythonhosted.org"]
+deny = []
+custom_requires_approval = true
+
+[malware]
+enabled = true
+fail_closed = false
+
+[package_age]
+enabled = false
+minimum_hours = 48
+exclusions = []
+
+[[exceptions]]
+policy_id = "ca9.package_age"
+ecosystem = "pypi"
+package = "example-package"
+version = "1.2.*"
+action = "warn"
+owner = "platform-security"
+reason = "Validated emergency release"
+expires = 2026-08-01
+```
+
+Validate and inspect the effective policy before using it in CI:
+
+```bash
+ca9 policy validate --policy ca9.toml
+ca9 policy explain --policy ca9.toml
+ca9 vet --repo . --policy ca9.toml
+```
+
+The policy controls whether ca9 passes, warns, or blocks package supply-chain
+findings. CLI flags such as `--trusted-index`, `--private-index`, and
+`--internal-package` can still be used for one-off runs. Exceptions are matched
+by policy ID and optional ecosystem/package/version globs, require an owner,
+reason, and expiry date, and are recorded in decision evidence. Expired
+exceptions do not apply. Known-malware decisions (`ca9.malware`) cannot be
+overridden.
+
+Install package-intelligence feed data when you want deterministic offline
+package-age or package-malware decisions:
+
+```bash
+ca9 feed update
+ca9 feed update --from ./ca9-feed.json
+ca9 feed status --policy ca9.toml
+```
+
+`ca9 feed update` without `--from` resolves `--from`, then `CA9_FEED_URL`, then
+the built-in default feed URL on the project's published `feed` branch. Use
+`--from` or `CA9_FEED_URL` to select a local or alternate hosted bundle.
+
+### Audit install scripts for npm v12 allowlists
+
+npm v12 became the `latest`/GA release on July 8, 2026. It skips dependency
+lifecycle scripts unless the package is approved in your project's `allowScripts`
+allowlist (pnpm ≥10 has a similar model). Instead of `npm approve-scripts --all`,
+audit the script-bearing packages with evidence first:
+
+```bash
+ca9 scripts audit .
+ca9 scripts audit . --emit commands
+```
+
+The audit requires a readable npm v2/v3 `package-lock.json`. Missing, malformed,
+unsupported, or unmaterializable script-bearing lock entries are hard errors, not
+empty results. Each lockfile occurrence is audited independently, including two
+occurrences with the same name and version at different install paths. Local
+workspace packages are excluded; external or out-of-root file sources remain visible
+as `review` findings.
+
+ca9 checks `preinstall`, `install`, and `postinstall`, plus `prepare` for
+non-registry dependencies. A version-matched `node_modules` manifest can supply hook
+text, but the package's registry policy identity comes from trusted lockfile source
+evidence, not package-controlled manifest fields. Offline or incomplete evidence
+remains `review`.
+
+Malware findings and explicitly denied registries produce `deny`; custom
+registries requiring approval are not fetched and remain `review`. If a malware
+feed configured as fail-closed is unavailable, the audit suppresses approvals and
+exits `1`. Whole-command native-build shapes such as `node-gyp rebuild` remain
+`review` even after clean analysis of a hash-verified artifact: the package artifact
+alone cannot prove which executable will run or fully establish GYP/build provenance.
+`--allow-unhashed-downloads` permits investigation of an unhashed artifact, but does
+not make that artifact verified approval evidence. v1 is intentionally
+deny/review-oriented and does not promise a reachable automatic approval path.
+
+`--emit commands` accounts for npm applying a package-name command to every installed
+occurrence of that name. A deny in any occurrence wins; otherwise, any reviewed
+occurrence suppresses approval. Before emitting a command, ca9 requires trusted npm
+policy identity and version evidence and an exact match between every audited locked
+occurrence and the installed `node_modules` tree. Approval commands use the explicit
+pinning form `npm approve-scripts <name> --allow-scripts-pin`. Missing or mismatched
+evidence produces a comment instead of a command. The generated `#` comments work in
+POSIX shells and PowerShell. ca9 never edits the allowlist or executes a generated
+command. Exit codes are `1` for a denial or global blocker, `2` when review findings
+remain, and `0` when neither is present.
+
+Scripts-audit options:
+
+```
+-r, --repo DIRECTORY            Project directory (alternative to DIRECTORY)
+-f, --format [table|json]       Report format  [default: table]
+--emit [report|commands]        Audit report or guarded npm command lines
+-o, --output PATH               Write output to a file instead of stdout
+--policy PATH                   ca9 package, registry, and malware policy TOML
+--offline                       Skip downloads; unverified packages remain review
+--allow-unhashed-downloads      Allow tarball fetch without lockfile integrity
+--max-artifact-mb N             Positive max artifact download size  [default: 100]
+```
+
+The positional `DIRECTORY` and `--repo` accept directories only. `--emit commands`
+uses comment-and-command text output and cannot be combined with `--format json`.
+
+### Run installs through ca9
+
+Use `ca9 run` when you want ca9 to preflight an install before package code can
+execute:
+
+```bash
+ca9 run -- npm ci
+ca9 run -- npm install express@4.18.2
+ca9 run -- npm i @scope/pkg@1.2.3
+ca9 run -- python -m pip install requests==2.31.0
+ca9 run -- pip install requests==2.31.0
+ca9 run -- pip install -r requirements.txt -c constraints.txt
+```
+
+`npm ci` and its clean-install aliases are checked against every exact non-project
+version in `package-lock.json`, including transitive dependencies. A missing,
+unreadable, or unsupported lockfile blocks before npm starts. Zero-argument
+`npm install` is also blocked because npm can update a stale lock and install
+unvetted versions; use `npm ci` for a lock-backed install. Direct npm and pip
+package specs remain supported. Local pip requirement and constraint files are
+parsed recursively before pip starts; includes resolve relative to their
+containing file and must remain inside the repository. Exact pins and hashes are
+retained as evidence, constraints refine declared requirements, and
+constraint-only packages are not treated as requested installs. Remote
+requirements, direct URLs, editable/local paths, extra indexes, find-links, and
+other package managers are blocked instead of being guessed. Explicit
+registry/index command options and npm/pip registry environment variables are
+checked against policy; alternate pip sources such as extra indexes and find-links
+are blocked until multi-source mediation is implemented.
+
+`ca9 run` checks the local package feed for known malware and package age,
+detects secret-bearing environment variables, strips or blocks secrets according
+to policy, executes the child command only when allowed, preserves the child
+exit code, and writes a redacted audit event stream. When package-age policy is
+enabled but a release time is missing from the local feed, pip preflight warns
+by default and blocks when `[mode].offline` is `block` or `strict`; npm unknown
+release times are deferred to the npm gateway so registry metadata can decide
+when the install actually resolves package versions.
+
+For npm and pip installs, `ca9 run` can also start child-process-scoped loopback
+gateways when a local feed is available. The npm gateway fetches upstream
+metadata, hides versions denied by policy, recomputes `dist-tags` when needed,
+and leaves upstream bytes unchanged when nothing is denied. The PyPI gateway
+filters Simple API wheel and sdist links denied by policy through `PIP_INDEX_URL`.
+Both gateways bind only to `127.0.0.1`, reject proxy-style absolute URLs, and
+clear child-process package-manager config sources that would bypass the
+loopback gateway. A requirements-file index is retained as upstream policy
+evidence, while ca9 appends the loopback index as the final child option so it
+cannot bypass mediation. Gateway rewrites and applied package exceptions are
+recorded in the runtime audit log.
+
+### Add CI shims
+
+For GitHub Actions, install opt-in package-manager shims after ca9 is available
+in the job:
+
+```bash
+ca9 setup ci install
+ca9 doctor ci
+```
+
+`ca9 setup ci install` writes `npm`, `pip`, and `python` shims under the ca9
+cache and appends that directory to `$GITHUB_PATH`. The `python` shim only routes
+`python -m pip install ...` through `ca9 run`; the npm and pip shims only route
+supported install commands. Other package-manager commands pass through to the
+real executable. Shims set an internal bypass flag while `ca9 run` executes the
+child command, so the real package manager runs without recursive shim
+invocation.
+
+### Add local shell shims
+
+For local opt-in interception, print the managed shell block first:
+
+```bash
+ca9 setup shell --print
+```
+
+Install only when you are ready to edit the selected shell profile:
+
+```bash
+ca9 setup shell --install
+ca9 doctor shell
+ca9 teardown shell
+```
+
+`ca9 setup shell --install` writes the same npm, pip, and python shims under
+`~/.cache/ca9/bin` and adds a ca9-owned block to your shell profile. Every edit
+creates a backup first. `ca9 teardown shell` removes only the ca9-managed block;
+it does not remove arbitrary matching PATH lines.
 
 ### Replay real incident fixtures
 
@@ -207,7 +508,8 @@ python scripts/incident_replay.py --strict --format table
 ca9 keeps real incident fixtures for npm package compromise, PyPI import-time malware,
 and GitHub-token compromise scenarios. The current matrix is intentionally honest:
 malware advisories and workflow-risk patterns are covered where fixtures prove them, while
-package-tarball, import-time malware, and identity/audit-log surfaces remain partial.
+npm/Python artifact heuristics, import-time malware, and identity/audit-log surfaces remain
+partial.
 
 For dependency-confusion controls, use `--internal-package` with one or more private
 package name patterns and `--private-index` for the indexes those packages are allowed to
@@ -257,12 +559,15 @@ ca9 check snyk.json --repo . --coverage coverage.json
 ca9 check dependabot.json --repo .
 ```
 
-Format is auto-detected. Supports **Snyk**, **Dependabot**, **Trivy**, and **pip-audit**:
+Format is auto-detected. Supports **Snyk**, **Dependabot**, **Trivy**, **Grype**,
+**OSV-Scanner**, and **pip-audit**:
 
 ```bash
 ca9 check snyk.json --repo .
 ca9 check dependabot.json --repo .
 ca9 check trivy.json --repo .
+ca9 check grype.json --repo .
+ca9 check osv-scanner.json --repo .
 ca9 check pip-audit.json --repo .
 ```
 
@@ -303,9 +608,21 @@ Confidence scoring is **verdict-directional** — evidence that supports the ver
 
 ```
 ca9 scan [OPTIONS]              Scan repository dependency versions via OSV.dev
-ca9 check SCA_REPORT [OPTIONS]  Analyze a Snyk/Dependabot/Trivy/pip-audit report
+ca9 check SCA_REPORT [OPTIONS]  Analyze a supported SCA JSON report
 ca9 inventory [PATH] [OPTIONS]  Show normalized package inventory
+ca9 protect [PATH] [OPTIONS]    Report dependency-install protection posture
 ca9 vet [PATH] [OPTIONS]        Run package supply-chain risk checks
+ca9 run [OPTIONS] -- COMMAND    Preflight and run supported package-manager installs
+ca9 scripts audit [DIRECTORY]   Audit dependency install scripts for npm allowlists
+ca9 policy validate [OPTIONS]   Validate ca9 package policy
+ca9 policy explain [OPTIONS]    Show effective ca9 package policy
+ca9 feed status [OPTIONS]       Show local package feed cache status
+ca9 feed update [OPTIONS]       Install a package intelligence feed snapshot
+ca9 setup ci [print|install]    Print or install CI package-manager shims
+ca9 setup shell [OPTIONS]       Print or install local shell package-manager shims
+ca9 doctor ci [OPTIONS]         Check CI shim installation
+ca9 doctor shell [OPTIONS]      Check local shell shim installation
+ca9 teardown shell [OPTIONS]    Remove ca9-managed shell profile block
 
 Common options:
   -r, --repo PATH                  Path to the project repository  [default: .]
@@ -338,6 +655,7 @@ Inventory-only options:
   -f, --format [table|json]         Output format  [default: table]
 
 Vet-only options:
+  --policy PATH                   ca9 package policy TOML
   --trusted-index URL               Trusted package index; repeatable
   --private-index URL               Private index allowed for internal packages
   --internal-package PATTERN        Internal package glob, e.g. acme-*; repeatable
@@ -350,10 +668,36 @@ Vet-only options:
   --require-known-license           Warn when artifact metadata has no known license
   --offline                         Use cached OSV data only for malware query
 
+Policy-only options:
+  --policy PATH                   ca9 package policy TOML
+  -f, --format [table|json]       Output format for policy explain
+
+Feed-only options:
+  --from PATH_OR_URL              Feed bundle URL, JSON file, or snapshot directory
+  --policy PATH                   ca9 package policy TOML for status/offline behavior
+  -f, --format [table|json]       Output format
+
+Run-only options:
+  --policy PATH                   ca9 package policy TOML
+  --dry-run                       Run preflight only; do not execute the child command
+  --audit-log PATH                Runtime audit JSONL path  [default: ~/.cache/ca9/audit.jsonl]
+  -f, --format [table|json]       Output format; use --dry-run for JSON pass decisions
+
+CI setup options:
+  --shim-dir PATH                 Directory for npm, pip, and python shims
+  -f, --format [table|json]       Output format for setup install or doctor
+
+Shell setup options:
+  --print                         Print the managed shell block without editing
+  --install                       Install shims and edit the selected profile
+  --profile PATH                  Shell profile to install, check, or teardown
+  --shim-dir PATH                 Directory for npm, pip, and python shims
+  -f, --format [table|json]       Output format for install, doctor, or teardown
+
 Exit codes:
-  0  Clean — no reachable CVEs
-  1  Reachable CVEs found — action needed
-  2  Inconclusive only — need more coverage data
+  0  No blocking findings for the selected command
+  1  Blocking findings or command/policy errors
+  2  Reachability scan produced inconclusive-only CVE results
 ```
 
 ### Config file
@@ -375,12 +719,30 @@ Accepted-risk and baseline options keep ignored findings visible in report outpu
 
 ### Caching and offline mode
 
-ca9 caches OSV vulnerability details (`~/.cache/ca9/osv/`, 24h TTL) and GitHub commit file lists (`~/.cache/ca9/commits/`, 7-day TTL) to reduce API calls.
+ca9 caches OSV vulnerability details (`~/.cache/ca9/osv/`, 24h TTL), GitHub
+commit file lists (`~/.cache/ca9/commits/`, 7-day TTL), and package
+intelligence feeds (`~/.cache/ca9/feed/`) to reduce network dependence and make
+CI runs deterministic. Runtime preflight writes redacted audit events to
+`~/.cache/ca9/audit.jsonl` by default.
 
 ```bash
 ca9 scan --repo . --offline           # use cached data only, no network
 ca9 scan --repo . --refresh-cache     # clear cache and re-fetch
+ca9 feed update                       # use default feed URL or CA9_FEED_URL
+ca9 feed update --from ./ca9-feed.json # install local package intelligence
+ca9 feed status --policy ca9.toml      # verify freshness and offline policy
 ```
+
+Package feeds use schema `ca9.feed.v1` and include four datasets:
+`pypi-malware`, `npm-malware`, `pypi-releases`, and `npm-releases`. Feed status
+verifies SHA-256 content hashes before using cached data. Missing or stale feeds
+warn or block according to `[mode].offline`; tampered feeds always block.
+
+Runtime audit events use schema `ca9.run.ledger.v1`. The JSONL stream records
+session start/end, command observation, package requests, decisions, feed use,
+offline fallback, gateway use, gateway-denied versions/links, secret names
+detected/stripped, and child process start/exit. ca9 logs secret names, never
+secret values, and redacts URL credentials and Authorization-like text.
 
 Set `GITHUB_TOKEN` to avoid GitHub API rate limits when ca9 fetches commit data for affected component analysis:
 
@@ -403,9 +765,11 @@ matching `--internal-package` is blocked if it resolves outside the configured
 `--private-index` values.
 
 When `--scan-artifacts` is enabled, fyn's artifact URLs and hashes let ca9 verify and
-inspect resolved wheels/sdists before applying malicious-package heuristics. This path
-does not install packages or execute package code. The same artifact metadata powers
-license checks through `--deny-license` and `--require-known-license`.
+inspect resolved wheels/sdists before applying malicious-package heuristics. npm
+`package-lock.json` entries likewise provide tarball URLs and SRI integrity for npm
+artifact scanning. This path does not install packages or execute package code. The same
+artifact metadata powers license checks through `--deny-license` and
+`--require-known-license`.
 
 Future ca9 commands can use fyn as an optional provider for dependency-path and lock-diff
 context, but absence of fyn should not break scans or CI gates.
@@ -434,7 +798,7 @@ Available tools:
 
 | Tool | What it does |
 |------|-------------|
-| `check_reachability` | Analyze an SCA report (Snyk, Dependabot, Trivy, pip-audit) |
+| `check_reachability` | Analyze a supported SCA report, including Grype and OSV-Scanner JSON |
 | `scan_dependencies` | Scan repository dependency versions via OSV.dev |
 | `check_coverage_quality` | Assess how reliable your coverage data is |
 | `explain_verdict` | Deep-dive a specific CVE's verdict with full evidence |
@@ -483,8 +847,29 @@ without pulling in a large dependency tree.
 - Static analysis traces `import` statements and `importlib.metadata` dependency trees. Dynamic imports (`importlib.import_module`, `__import__`) are not detected.
 - Coverage quality directly impacts dynamic analysis. If your tests don't exercise a code path, ca9 can't detect it dynamically.
 - Transitive dependency resolution requires packages to be installed. Without installed deps, ca9 falls back to direct-import-only checking.
-- `fyn.lock` and npm `package-lock.json` support currently power inventory and the first `ca9 vet` local supply-chain checks. Optional artifact static analysis currently scans Python wheel/sdist artifacts only. Full attack detection still needs richer external intelligence for maintainer changes, release-age anomalies, typosquatting, provenance, and active malware analysis.
-- Python reachability only for now; npm support is inventory evidence, not JavaScript reachability.
+- Runtime install enforcement covers lockfile-backed `npm ci`, plus direct
+  `npm install` / `npm i`, `pip install`, and
+  `python -m pip install` specs. Lock-backed preflight currently requires
+  `package-lock.json` lockfile version 2 or 3; `npm-shrinkwrap.json` is not yet
+  supported. It does not yet mediate yarn,
+  pnpm, uv, poetry, pipx, npx, requirements files, direct URLs, local paths, or
+  alternate pip sources such as extra indexes and find-links.
+- The default hosted feed is published, and local bundles or `CA9_FEED_URL` can
+  override it. Feed availability still depends on GitHub hosting/network access.
+- The feed builder currently ships malware data and empty releases datasets. The
+  `covers_since` release-window mechanism is implemented, but complete recent
+  npm/PyPI release firehoses are still a data-ops task.
+- Feed integrity is hash-verified locally, but feed snapshots are not yet signed.
+- OSV malware records with explicit affected versions are emitted per version, and
+  all-package records are emitted name-only. Bounded OSV range-only malware records
+  are skipped until range-aware feed matching exists, to avoid false whole-package
+  blocks.
+- Artifact heuristics catch common Python and npm malware patterns, but they are
+  static signatures, not sandboxed dynamic malware analysis. Maintainer hijack,
+  typosquatting, provenance/Sigstore/SLSA, yanked metadata, and repository takeover
+  signals still need richer external intelligence.
+- Python CVE reachability is implemented; npm support is inventory, package-policy,
+  artifact, and runtime evidence, not JavaScript reachability analysis.
 
 ## Development
 

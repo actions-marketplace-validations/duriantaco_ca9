@@ -37,7 +37,11 @@ ca9 combines conservative static and runtime signals for each vulnerability:
 - **Direct OSV scanning** with `ca9 scan`, so you can analyze installed or declared Python packages without a separate SCA report.
 - **Package inventory** with `ca9 inventory`, including native `fyn.lock` and npm `package-lock.json` support for resolved packages, artifacts, hashes/integrity values, groups, and dependency edges.
 - **Supply-chain gates** with `ca9 vet` for untrusted indexes, dependency confusion, malicious package advisories, artifact static analysis, and license policy.
-- **SCA report parsing** for Snyk, Dependabot, Trivy, and pip-audit JSON.
+- **Protection posture** with `ca9 protect` for enforceable install workflows,
+  feed readiness, expiring exceptions, package decisions, and GitHub Actions
+  trust boundaries.
+- **SCA report parsing** for Snyk, Dependabot, Trivy, Grype, OSV-Scanner, and
+  pip-audit JSON.
 - **CI-friendly outputs** including table, JSON, SARIF, OpenVEX, Markdown, HTML, remediation plans, and machine-readable action plans.
 - **SBOM enrichment** for CycloneDX and SPDX documents.
 - **MCP server** for running reachability checks from LLM-powered tools.
@@ -67,10 +71,11 @@ Total: 3  |  Reachable: 1  |  Unreachable: 2  |  Inconclusive: 0
 | Scan repository dependency versions with OSV | `ca9 scan --repo .` |
 | Inspect normalized package inventory | `ca9 inventory --repo . -f json` |
 | Run supply-chain risk checks | `ca9 vet --repo . --scan-artifacts` |
+| Check dependency-install protection | `ca9 protect --repo .` |
 | Gate internal package resolution | `ca9 vet --repo . --internal-package 'acme-*' --private-index https://packages.acme.internal/simple` |
 | Gate denied licenses | `ca9 vet --repo . --deny-license AGPL-3.0 --deny-license GPL-3.0` |
 | Run the supply-chain demo | `bash demo/supply_chain/run_demo.sh` |
-| Analyze Snyk, Dependabot, Trivy, or pip-audit JSON | `ca9 check report.json --repo .` |
+| Analyze supported SCA JSON, including Grype and OSV-Scanner | `ca9 check report.json --repo .` |
 | Add dynamic evidence | `ca9 check report.json --coverage coverage.json` |
 | Upload GitHub code scanning results | `ca9 check report.json -f sarif -o ca9.sarif` |
 | Generate OpenVEX statements | `ca9 check report.json -f vex -o openvex.json` |

@@ -1,0 +1,1995 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+import shlex
+import uuid
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
+from typing import Any
+from urllib.parse import urlparse
+
+from packaging.requirements import InvalidRequirement, Requirement
+from packaging.specifiers import SpecifierSet
+from packaging.utils import canonicalize_name
+
+from ca9.package_feed import (
+    FeedError,
+    FeedSnapshot,
+    FeedStatus,
+    default_cache_root,
+    feed_status,
+    lookup_malware,
+    lookup_release_time,
+    release_window_covers,
+)
+from ca9.package_policy import (
+    PackagePolicy,
+    action_for_mode,
+    find_policy_exception,
+)
+from ca9.readers.package_lock import read_package_lock
+
+RUN_SCHEMA = "ca9.run.v1"
+LEDGER_SCHEMA = "ca9.run.ledger.v1"
+SECRET_ENV_PATTERNS = (
+    "*_TOKEN",
+    "*_SECRET",
+    "*_KEY",
+    "AWS_*",
+    "GCP_*",
+    "GOOGLE_*",
+    "AZURE_*",
+    "NPM_TOKEN",
+    "PYPI_TOKEN",
+    "GITHUB_TOKEN",
+)
+_URL_CREDENTIALS_RE = re.compile(r"(?P<prefix>(?:https?|git\+https)://)(?P<creds>[^/@\s]+)@")
+_AUTHORIZATION_RE = re.compile(
+    r"(?i)\b(?P<name>authorization|proxy-authorization)"
+    r"(?P<sep>\s*[:=]\s*)"
+    r"(?P<scheme>bearer|basic|token)?"
+    r"(?P<space>\s*)"
+    r"(?P<value>[^,\s;]+)"
+)
+SUPPORTED_PIP_FLAGS_WITH_VALUE = {
+    "--index-url",
+    "-i",
+    "--trusted-host",
+}
+UNSUPPORTED_PIP_SOURCE_FLAGS = {
+    "--extra-index-url",
+    "--find-links",
+    "-f",
+}
+SUPPORTED_PIP_BOOL_FLAGS = {
+    "--no-deps",
+    "--upgrade",
+    "-U",
+    "--pre",
+    "--require-hashes",
+    "--no-cache-dir",
+    "--disable-pip-version-check",
+}
+PIP_REQUIREMENT_FLAGS = {"-r", "--requirement"}
+PIP_CONSTRAINT_FLAGS = {"-c", "--constraint"}
+MAX_PIP_REQUIREMENT_DEPTH = 16
+_PIP_HASH_RE = re.compile(
+    r"(?:^|\s)--hash(?:=|\s+)"
+    r"(?P<hash>(?:sha256:[0-9a-fA-F]{64}|sha384:[0-9a-fA-F]{96}|sha512:[0-9a-fA-F]{128}))"
+    r"(?=\s|$)"
+)
+SUPPORTED_NPM_FLAGS_WITH_VALUE = {
+    "--registry",
+    "--tag",
+    "--cache",
+    "--prefix",
+    "--omit",
+    "--include",
+    "--install-strategy",
+    "--workspace",
+    "-w",
+}
+SUPPORTED_NPM_BOOL_FLAGS = {
+    "--save",
+    "--save-dev",
+    "-D",
+    "--save-optional",
+    "-O",
+    "--save-exact",
+    "-E",
+    "--ignore-scripts",
+    "--global",
+    "-g",
+    "--legacy-bundling",
+    "--global-style",
+    "--strict-peer-deps",
+    "--foreground-scripts",
+    "--audit",
+    "--no-audit",
+    "--bin-links",
+    "--no-bin-links",
+    "--fund",
+    "--no-fund",
+    "--dry-run",
+    "--workspaces",
+    "--include-workspace-root",
+    "--install-links",
+    "--legacy-peer-deps",
+}
+NPM_INSTALL_SUBCOMMANDS = frozenset({"install", "i"})
+NPM_CLEAN_INSTALL_SUBCOMMANDS = frozenset(
+    {"ci", "clean-install", "ic", "install-clean", "isntall-clean"}
+)
+NPM_REGISTRY_ENV_NAMES = ("NPM_CONFIG_REGISTRY", "npm_config_registry")
+NPM_CONFIG_FILE_ENV_NAMES = (
+    "NPM_CONFIG_USERCONFIG",
+    "npm_config_userconfig",
+    "NPM_CONFIG_GLOBALCONFIG",
+    "npm_config_globalconfig",
+)
+PIP_INDEX_ENV_NAMES = ("PIP_INDEX_URL",)
+PIP_UNSUPPORTED_SOURCE_ENV_NAMES = ("PIP_EXTRA_INDEX_URL", "PIP_FIND_LINKS")
+PIP_CONFIG_FILE_ENV_NAMES = ("PIP_CONFIG_FILE",)
+
+
+@dataclass(frozen=True)
+class PackageRequest:
+    ecosystem: str
+    name: str
+    raw_spec: str
+    version_spec: str | None = None
+    exact_version: str | None = None
+    source_path: str | None = None
+    hashes: tuple[str, ...] = ()
+
+    @property
+    def key(self) -> str:
+        if self.exact_version:
+            return f"{self.ecosystem}:{self.name}@{self.exact_version}"
+        return f"{self.ecosystem}:{self.name}"
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "ecosystem": self.ecosystem,
+            "name": self.name,
+            "raw_spec": redact_sensitive_text(self.raw_spec),
+        }
+        if self.version_spec:
+            data["version_spec"] = self.version_spec
+        if self.exact_version:
+            data["exact_version"] = self.exact_version
+        if self.source_path:
+            data["source_path"] = self.source_path
+        if self.hashes:
+            data["hashes"] = list(self.hashes)
+        return data
+
+
+@dataclass(frozen=True)
+class RegistrySource:
+    ecosystem: str
+    kind: str
+    url: str
+    option: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "ecosystem": self.ecosystem,
+            "kind": self.kind,
+            "url": redact_sensitive_text(self.url),
+            "option": self.option,
+        }
+
+
+@dataclass(frozen=True)
+class RuntimeCommand:
+    family: str
+    command: tuple[str, ...]
+    package_requests: tuple[PackageRequest, ...]
+    registry_sources: tuple[RegistrySource, ...] = ()
+    install_scripts_possible: bool = True
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "family": self.family,
+            "command": [redact_sensitive_text(item) for item in self.command],
+            "package_requests": [request.to_dict() for request in self.package_requests],
+            "install_scripts_possible": self.install_scripts_possible,
+        }
+        if self.registry_sources:
+            data["registry_sources"] = [source.to_dict() for source in self.registry_sources]
+        return data
+
+
+@dataclass(frozen=True)
+class RuntimeDecision:
+    action: str
+    policy_id: str
+    reason: str
+    package: str | None = None
+    version: str | None = None
+    evidence: dict[str, Any] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        data = {
+            "action": self.action,
+            "policy_id": self.policy_id,
+            "reason": redact_sensitive_text(self.reason),
+        }
+        if self.package:
+            data["package"] = self.package
+        if self.version:
+            data["version"] = self.version
+        if self.evidence:
+            data["evidence"] = _redact_value(self.evidence)
+        return data
+
+
+@dataclass(frozen=True)
+class RuntimePreflight:
+    command: RuntimeCommand
+    decisions: tuple[RuntimeDecision, ...]
+    secret_names: tuple[str, ...] = ()
+    stripped_secret_names: tuple[str, ...] = ()
+    feed: FeedStatus | None = None
+
+    @property
+    def action(self) -> str:
+        actions = {decision.action for decision in self.decisions}
+        if "block" in actions:
+            return "block"
+        if "strip" in actions:
+            return "warn"
+        if "warn" in actions:
+            return "warn"
+        return "pass"
+
+    @property
+    def blocked(self) -> bool:
+        return self.action == "block"
+
+    def to_dict(
+        self,
+        *,
+        executed: bool = False,
+        child_exit_code: int | None = None,
+        ledger_path: Path | None = None,
+    ) -> dict[str, Any]:
+        data = {
+            "schema_version": RUN_SCHEMA,
+            "action": self.action,
+            "command": self.command.to_dict(),
+            "decisions": [decision.to_dict() for decision in self.decisions],
+            "secret_names": list(self.secret_names),
+            "stripped_secret_names": list(self.stripped_secret_names),
+            "executed": executed,
+            "child_exit_code": child_exit_code,
+        }
+        if self.feed:
+            data["feed"] = {
+                "state": self.feed.state,
+                "action": self.feed.action,
+                "reason": self.feed.reason,
+                "snapshot_id": self.feed.snapshot.snapshot_id if self.feed.snapshot else None,
+            }
+        if ledger_path:
+            data["ledger_path"] = str(ledger_path)
+        return data
+
+
+@dataclass(frozen=True)
+class LedgerEvent:
+    event_kind: str
+    payload: dict[str, Any]
+    session_id: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": LEDGER_SCHEMA,
+            "event_kind": self.event_kind,
+            "session_id": self.session_id,
+            "timestamp": _utc_now_iso(),
+            "payload": _redact_value(self.payload),
+        }
+
+
+class RuntimePreflightError(ValueError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        policy_id: str = "ca9.runtime.unsupported_command",
+    ) -> None:
+        super().__init__(message)
+        self.policy_id = policy_id
+
+
+@dataclass(frozen=True)
+class _ParsedPipRequirement:
+    request: PackageRequest
+    requirement: Requirement
+
+
+def parse_install_command(
+    command: tuple[str, ...] | list[str],
+    *,
+    cwd: Path | None = None,
+) -> RuntimeCommand:
+    args = tuple(command)
+    if not args:
+        raise RuntimePreflightError("ca9 run needs a package-manager command after --")
+
+    if _is_npm_install(args):
+        requests, registry_sources = _parse_npm_install(args, cwd=cwd or Path.cwd())
+        return RuntimeCommand(
+            family="npm",
+            command=args,
+            package_requests=tuple(requests),
+            registry_sources=tuple(registry_sources),
+            install_scripts_possible="--ignore-scripts" not in args,
+        )
+
+    if _is_pip_install(args):
+        requests, registry_sources = _parse_pip_install(args, cwd=cwd or Path.cwd())
+        return RuntimeCommand(
+            family="pip",
+            command=args,
+            package_requests=tuple(requests),
+            registry_sources=tuple(registry_sources),
+        )
+
+    raise RuntimePreflightError(
+        "unsupported command family; ca9 run supports npm install, npm i, npm ci, "
+        "python -m pip install, and pip install"
+    )
+
+
+def evaluate_runtime_preflight(
+    command: tuple[str, ...] | list[str],
+    policy: PackagePolicy,
+    *,
+    env: dict[str, str] | None = None,
+    feed_cache_dir: Path | None = None,
+    now: datetime | None = None,
+    cwd: Path | None = None,
+) -> RuntimePreflight:
+    active_env = env if env is not None else dict(os.environ)
+    try:
+        parsed = parse_install_command(command, cwd=cwd)
+    except RuntimePreflightError as exc:
+        parsed = RuntimeCommand(
+            family="unsupported",
+            command=tuple(command),
+            package_requests=(),
+            install_scripts_possible=False,
+        )
+        return RuntimePreflight(
+            command=parsed,
+            decisions=(
+                RuntimeDecision(
+                    action="block",
+                    policy_id=exc.policy_id,
+                    reason=str(exc),
+                ),
+            ),
+        )
+
+    parsed = _with_env_registry_sources(parsed, active_env)
+    decisions: list[RuntimeDecision] = []
+    feed = _load_feed_status_if_needed(parsed, policy, feed_cache_dir=feed_cache_dir, now=now)
+    decisions.extend(_registry_source_decisions(parsed, policy))
+    decisions.extend(_feed_availability_decisions(feed, policy))
+    if feed and feed.snapshot:
+        decisions.extend(_malware_decisions(parsed, policy, feed.snapshot, feed_cache_dir))
+        decisions.extend(_package_age_decisions(parsed, policy, feed.snapshot, now=now))
+    decisions = _apply_runtime_policy_exceptions(decisions, parsed, policy, now=now)
+
+    secrets = detect_secret_env(active_env)
+    stripped: tuple[str, ...] = ()
+    secret_decision, stripped = _secret_decision(parsed, policy, secrets)
+    if secret_decision:
+        decisions.append(secret_decision)
+
+    return RuntimePreflight(
+        command=parsed,
+        decisions=tuple(decisions),
+        secret_names=secrets,
+        stripped_secret_names=stripped,
+        feed=feed,
+    )
+
+
+def _apply_runtime_policy_exceptions(
+    decisions: list[RuntimeDecision],
+    command: RuntimeCommand,
+    policy: PackagePolicy,
+    *,
+    now: datetime | None,
+) -> list[RuntimeDecision]:
+    ecosystem = "pypi" if command.family == "pip" else command.family
+    applied: list[RuntimeDecision] = []
+    for decision in decisions:
+        if decision.action == "pass" or not decision.package:
+            applied.append(decision)
+            continue
+        exception = find_policy_exception(
+            policy.exceptions,
+            policy_id=decision.policy_id,
+            ecosystem=ecosystem,
+            package=decision.package,
+            version=decision.version,
+            now=now,
+        )
+        if exception is None:
+            applied.append(decision)
+            continue
+        evidence = dict(decision.evidence or {})
+        evidence["policy_exception"] = {
+            **exception.to_dict(),
+            "original_action": decision.action,
+        }
+        applied.append(
+            replace(
+                decision,
+                action=exception.action,
+                reason=(
+                    f"{decision.reason}; exception owned by {exception.owner} applies "
+                    f"until {exception.expires}: {exception.reason}"
+                ),
+                evidence=evidence,
+            )
+        )
+    return applied
+
+
+def child_environment(env: dict[str, str], preflight: RuntimePreflight) -> dict[str, str]:
+    child_env = dict(env)
+    for name in preflight.stripped_secret_names:
+        child_env.pop(name, None)
+    return child_env
+
+
+def primary_registry_url(command: RuntimeCommand) -> str | None:
+    for source in command.registry_sources:
+        if source.kind in {"npm-registry", "pypi-index"} and not source.option.startswith(
+            "package-lock.json:"
+        ):
+            return source.url
+    for source in command.registry_sources:
+        if source.kind in {"npm-registry", "pypi-index"}:
+            return source.url
+    return None
+
+
+def gateway_child_command(
+    command: RuntimeCommand,
+    *,
+    registry_url: str | None = None,
+) -> tuple[str, ...]:
+    if command.family == "npm":
+        return _strip_option_values(command.command, {"--registry"})
+    if command.family == "pip":
+        stripped = _strip_option_values(command.command, {"--index-url", "-i"})
+        if registry_url:
+            return (*stripped, "--index-url", registry_url)
+        return stripped
+    return command.command
+
+
+def default_ledger_path() -> Path:
+    return Path(os.environ.get("CA9_AUDIT_LOG", default_cache_root() / "audit.jsonl")).expanduser()
+
+
+def new_ledger_session_id() -> str:
+    return uuid.uuid4().hex
+
+
+def preflight_ledger_events(
+    preflight: RuntimePreflight,
+    *,
+    session_id: str,
+    dry_run: bool = False,
+) -> tuple[LedgerEvent, ...]:
+    events = [
+        LedgerEvent(
+            "session_started",
+            {
+                "action": preflight.action,
+                "blocked": preflight.blocked,
+                "dry_run": dry_run,
+            },
+            session_id,
+        ),
+        LedgerEvent("command_observed", preflight.command.to_dict(), session_id),
+    ]
+    for request in preflight.command.package_requests:
+        events.append(LedgerEvent("package_requested", request.to_dict(), session_id))
+    if preflight.feed:
+        feed_payload = {
+            "state": preflight.feed.state,
+            "action": preflight.feed.action,
+            "reason": preflight.feed.reason,
+            "snapshot_id": preflight.feed.snapshot.snapshot_id if preflight.feed.snapshot else None,
+        }
+        events.append(LedgerEvent("feed_used", feed_payload, session_id))
+        if preflight.feed.state in {"missing", "stale"}:
+            events.append(LedgerEvent("offline_fallback", feed_payload, session_id))
+    if preflight.secret_names:
+        events.append(
+            LedgerEvent(
+                "secrets_detected", {"secret_names": list(preflight.secret_names)}, session_id
+            )
+        )
+    if preflight.stripped_secret_names:
+        events.append(
+            LedgerEvent(
+                "secrets_stripped",
+                {"secret_names": list(preflight.stripped_secret_names)},
+                session_id,
+            )
+        )
+    for decision in preflight.decisions:
+        events.append(LedgerEvent("decision_emitted", decision.to_dict(), session_id))
+    return tuple(events)
+
+
+def child_process_started_event(
+    preflight: RuntimePreflight,
+    *,
+    session_id: str,
+) -> LedgerEvent:
+    return LedgerEvent("child_process_started", preflight.command.to_dict(), session_id)
+
+
+def child_process_exited_event(
+    *,
+    session_id: str,
+    child_exit_code: int,
+) -> LedgerEvent:
+    return LedgerEvent("child_process_exited", {"exit_code": child_exit_code}, session_id)
+
+
+def session_ended_event(
+    preflight: RuntimePreflight,
+    *,
+    session_id: str,
+    executed: bool,
+    child_exit_code: int | None,
+) -> LedgerEvent:
+    return LedgerEvent(
+        "session_ended",
+        {
+            "action": preflight.action,
+            "blocked": preflight.blocked,
+            "executed": executed,
+            "child_exit_code": child_exit_code,
+        },
+        session_id,
+    )
+
+
+def append_ledger_events(
+    events: tuple[LedgerEvent, ...] | list[LedgerEvent],
+    *,
+    ledger_path: Path | None = None,
+) -> Path:
+    path = ledger_path or default_ledger_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as f:
+        for event in events:
+            f.write(json.dumps(event.to_dict(), sort_keys=True, separators=(",", ":")))
+            f.write("\n")
+    return path
+
+
+def format_preflight(preflight: RuntimePreflight) -> str:
+    lines = [
+        f"ca9 runtime preflight: {preflight.action}",
+        f"Command: {' '.join(redact_sensitive_text(item) for item in preflight.command.command)}",
+    ]
+    if preflight.command.package_requests:
+        lines.append("Packages:")
+        for request in preflight.command.package_requests:
+            version = f" {request.exact_version}" if request.exact_version else ""
+            lines.append(f"  - {request.ecosystem}:{request.name}{version}")
+    if preflight.secret_names:
+        lines.append("Secrets detected: " + ", ".join(preflight.secret_names))
+    if preflight.stripped_secret_names:
+        lines.append("Secrets stripped: " + ", ".join(preflight.stripped_secret_names))
+    if preflight.feed:
+        lines.append(f"Feed: {preflight.feed.state} ({preflight.feed.reason})")
+    if preflight.decisions:
+        lines.append("Decisions:")
+        for decision in preflight.decisions:
+            target = f" {decision.package}" if decision.package else ""
+            lines.append(
+                f"  - [{decision.action.upper()}] {decision.policy_id}{target}: "
+                f"{redact_sensitive_text(decision.reason)}"
+            )
+    else:
+        lines.append("No blocking runtime policy decisions.")
+    return "\n".join(lines)
+
+
+def detect_secret_env(env: dict[str, str]) -> tuple[str, ...]:
+    names: list[str] = []
+    for name, value in env.items():
+        if not value:
+            continue
+        upper = name.upper()
+        if any(_match_secret_pattern(upper, pattern) for pattern in SECRET_ENV_PATTERNS):
+            names.append(name)
+    return tuple(sorted(names))
+
+
+def redact_sensitive_text(value: str) -> str:
+    redacted = _URL_CREDENTIALS_RE.sub(r"\g<prefix>[redacted]@", value)
+    return _AUTHORIZATION_RE.sub(_redact_authorization_match, redacted)
+
+
+def _redact_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return redact_sensitive_text(value)
+    if isinstance(value, dict):
+        return {key: _redact_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_value(item) for item in value)
+    return value
+
+
+def _redact_authorization_match(match: re.Match[str]) -> str:
+    scheme = match.group("scheme") or ""
+    space = " " if scheme else ""
+    return f"{match.group('name')}{match.group('sep')}{scheme}{space}[redacted]"
+
+
+def _is_npm_install(args: tuple[str, ...]) -> bool:
+    return (
+        len(args) >= 2
+        and args[0] == "npm"
+        and args[1] in NPM_INSTALL_SUBCOMMANDS | NPM_CLEAN_INSTALL_SUBCOMMANDS
+    )
+
+
+def _is_pip_install(args: tuple[str, ...]) -> bool:
+    if len(args) >= 3 and args[0] == "pip" and args[1] == "install":
+        return True
+    return len(args) >= 5 and args[0] == "python" and args[1:4] == ("-m", "pip", "install")
+
+
+def _parse_npm_install(
+    args: tuple[str, ...],
+    *,
+    cwd: Path,
+) -> tuple[list[PackageRequest], list[RegistrySource]]:
+    subcommand = args[1]
+    clean_install = subcommand in NPM_CLEAN_INSTALL_SUBCOMMANDS
+    if clean_install and any(arg.split("=", 1)[0] == "--prefix" for arg in args[2:]):
+        raise RuntimePreflightError(
+            "npm ci --prefix is unsupported because it can select a different lockfile"
+        )
+    specs, registry_sources = _collect_specs(
+        args[2:],
+        bool_flags=SUPPORTED_NPM_BOOL_FLAGS,
+        flags_with_value=SUPPORTED_NPM_FLAGS_WITH_VALUE,
+        registry_flags={"--registry"},
+        manager="npm",
+        ecosystem="npm",
+        require_specs=not clean_install,
+    )
+    if clean_install and specs:
+        raise RuntimePreflightError("npm ci does not accept direct package specs")
+    if clean_install:
+        locked_requests, locked_sources = _npm_lock_requests(cwd)
+        return locked_requests, [*registry_sources, *locked_sources]
+    return [_parse_npm_spec(spec) for spec in specs], registry_sources
+
+
+def _parse_pip_install(
+    args: tuple[str, ...],
+    *,
+    cwd: Path,
+) -> tuple[list[PackageRequest], list[RegistrySource]]:
+    start = 2 if args[0] == "pip" else 4
+    repo_path = cwd.resolve()
+    requirements: list[_ParsedPipRequirement] = []
+    constraints: dict[str, list[Requirement]] = {}
+    registry_sources: list[RegistrySource] = []
+    visited_files: set[tuple[Path, bool]] = set()
+    active_files: set[Path] = set()
+
+    index = start
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            raise RuntimePreflightError(
+                "pip install argument terminator is unsupported because it can bypass "
+                "gateway option enforcement"
+            )
+
+        file_option = _pip_file_option(arg)
+        if file_option is not None:
+            flag_name, inline_value = file_option
+            value, index = _pip_option_value(args, index, flag_name, inline_value)
+            _read_pip_requirement_file(
+                value,
+                is_constraint=flag_name in PIP_CONSTRAINT_FLAGS,
+                base_dir=repo_path,
+                repo_path=repo_path,
+                requirements=requirements,
+                constraints=constraints,
+                registry_sources=registry_sources,
+                visited_files=visited_files,
+                active_files=active_files,
+                depth=0,
+            )
+            index += 1
+            continue
+
+        if arg.startswith("-"):
+            flag_name = arg.split("=", 1)[0]
+            if flag_name in UNSUPPORTED_PIP_SOURCE_FLAGS:
+                raise RuntimePreflightError(
+                    f"pip source option is not supported by ca9 run yet: {flag_name}"
+                )
+            if flag_name in SUPPORTED_PIP_FLAGS_WITH_VALUE:
+                inline_value = arg.split("=", 1)[1] if "=" in arg else None
+                value, index = _pip_option_value(args, index, flag_name, inline_value)
+                if flag_name in {"--index-url", "-i"}:
+                    registry_sources.append(
+                        RegistrySource(
+                            ecosystem="pypi",
+                            kind="pypi-index",
+                            url=value,
+                            option=flag_name,
+                        )
+                    )
+            elif flag_name not in SUPPORTED_PIP_BOOL_FLAGS:
+                raise RuntimePreflightError(f"unsupported pip install option: {arg}")
+            index += 1
+            continue
+
+        requirements.append(_parse_pip_requirement(arg))
+        index += 1
+
+    active_requirements = [
+        parsed for parsed in requirements if _requirement_marker_applies(parsed.requirement)
+    ]
+    if not active_requirements:
+        raise RuntimePreflightError(
+            "pip install command did not include an applicable direct package spec"
+        )
+    return _apply_pip_constraints(active_requirements, constraints), registry_sources
+
+
+def _pip_file_option(arg: str) -> tuple[str, str | None] | None:
+    for flag_name in ("--requirement", "--constraint"):
+        if arg == flag_name:
+            return flag_name, None
+        if arg.startswith(f"{flag_name}="):
+            return flag_name, arg.split("=", 1)[1]
+    for flag_name in ("-r", "-c"):
+        if arg == flag_name:
+            return flag_name, None
+        if arg.startswith(flag_name) and len(arg) > len(flag_name):
+            value = arg[len(flag_name) :]
+            return flag_name, value.removeprefix("=")
+    return None
+
+
+def _pip_option_value(
+    args: tuple[str, ...],
+    index: int,
+    flag_name: str,
+    inline_value: str | None,
+) -> tuple[str, int]:
+    if inline_value is not None:
+        value = inline_value
+    else:
+        index += 1
+        if index >= len(args):
+            raise RuntimePreflightError(f"pip install option needs a value: {flag_name}")
+        value = args[index]
+    if not value.strip():
+        raise RuntimePreflightError(f"pip install option needs a value: {flag_name}")
+    return value, index
+
+
+def _read_pip_requirement_file(
+    raw_path: str,
+    *,
+    is_constraint: bool,
+    base_dir: Path,
+    repo_path: Path,
+    requirements: list[_ParsedPipRequirement],
+    constraints: dict[str, list[Requirement]],
+    registry_sources: list[RegistrySource],
+    visited_files: set[tuple[Path, bool]],
+    active_files: set[Path],
+    depth: int,
+) -> None:
+    if depth > MAX_PIP_REQUIREMENT_DEPTH:
+        raise RuntimePreflightError(
+            f"pip requirement include depth exceeds {MAX_PIP_REQUIREMENT_DEPTH}",
+            policy_id="ca9.runtime.requirements_unavailable",
+        )
+    path = _resolve_pip_requirement_path(raw_path, base_dir=base_dir, repo_path=repo_path)
+    if path in active_files:
+        raise RuntimePreflightError(
+            f"pip requirement include cycle detected at {_relative_path(path, repo_path)}",
+            policy_id="ca9.runtime.requirements_unavailable",
+        )
+    visit_key = (path, is_constraint)
+    if visit_key in visited_files:
+        return
+    visited_files.add(visit_key)
+    active_files.add(path)
+
+    try:
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise RuntimePreflightError(
+                f"cannot read pip requirement file {_relative_path(path, repo_path)}: {exc}",
+                policy_id="ca9.runtime.requirements_unavailable",
+            ) from exc
+
+        source_path = _relative_path(path, repo_path)
+        for line_number, raw_line in _logical_pip_requirement_lines(content):
+            line = _strip_pip_requirement_comment(raw_line)
+            if not line:
+                continue
+
+            try:
+                tokens = tuple(shlex.split(line, comments=False, posix=True))
+            except ValueError as exc:
+                raise RuntimePreflightError(
+                    f"invalid quoting in {source_path}:{line_number}: {exc}",
+                    policy_id="ca9.runtime.requirements_unavailable",
+                ) from exc
+            if not tokens:
+                continue
+
+            include_option = _pip_file_option(tokens[0])
+            if include_option is not None:
+                flag_name, inline_value = include_option
+                value = _requirement_line_option_value(
+                    tokens,
+                    flag_name=flag_name,
+                    inline_value=inline_value,
+                    source_path=source_path,
+                    line_number=line_number,
+                )
+                _read_pip_requirement_file(
+                    value,
+                    is_constraint=flag_name in PIP_CONSTRAINT_FLAGS,
+                    base_dir=path.parent,
+                    repo_path=repo_path,
+                    requirements=requirements,
+                    constraints=constraints,
+                    registry_sources=registry_sources,
+                    visited_files=visited_files,
+                    active_files=active_files,
+                    depth=depth + 1,
+                )
+                continue
+
+            flag_name = tokens[0].split("=", 1)[0]
+            if flag_name in UNSUPPORTED_PIP_SOURCE_FLAGS:
+                raise RuntimePreflightError(
+                    f"pip source option is not supported in {source_path}: {flag_name}",
+                    policy_id="ca9.runtime.requirements_unavailable",
+                )
+            if flag_name in SUPPORTED_PIP_FLAGS_WITH_VALUE:
+                inline_value = tokens[0].split("=", 1)[1] if "=" in tokens[0] else None
+                value = _requirement_line_option_value(
+                    tokens,
+                    flag_name=flag_name,
+                    inline_value=inline_value,
+                    source_path=source_path,
+                    line_number=line_number,
+                )
+                if flag_name in {"--index-url", "-i"}:
+                    registry_sources.append(
+                        RegistrySource(
+                            ecosystem="pypi",
+                            kind="pypi-index",
+                            url=value,
+                            option=f"{source_path}:{line_number}:{flag_name}",
+                        )
+                    )
+                continue
+            if flag_name in SUPPORTED_PIP_BOOL_FLAGS:
+                if len(tokens) != 1:
+                    raise RuntimePreflightError(
+                        f"unexpected value after {flag_name} in {source_path}:{line_number}",
+                        policy_id="ca9.runtime.requirements_unavailable",
+                    )
+                continue
+            if tokens[0].startswith("-"):
+                raise RuntimePreflightError(
+                    f"unsupported pip requirement option in "
+                    f"{source_path}:{line_number}: {tokens[0]}",
+                    policy_id="ca9.runtime.requirements_unavailable",
+                )
+
+            requirement_text, hashes = _extract_pip_hashes(
+                line,
+                source_path=source_path,
+                line_number=line_number,
+            )
+            parsed = _parse_pip_requirement(
+                requirement_text,
+                source_path=source_path,
+                hashes=hashes,
+            )
+            if is_constraint:
+                if hashes:
+                    raise RuntimePreflightError(
+                        f"constraint entries cannot contain hashes in {source_path}:{line_number}",
+                        policy_id="ca9.runtime.requirements_unavailable",
+                    )
+                constraints.setdefault(parsed.request.name, []).append(parsed.requirement)
+            else:
+                requirements.append(parsed)
+    finally:
+        active_files.remove(path)
+
+
+def _resolve_pip_requirement_path(
+    raw_path: str,
+    *,
+    base_dir: Path,
+    repo_path: Path,
+) -> Path:
+    candidate_text = raw_path.strip()
+    if (
+        not candidate_text
+        or "\x00" in candidate_text
+        or candidate_text.startswith("~")
+        or "$" in candidate_text
+        or urlparse(candidate_text).scheme
+    ):
+        raise RuntimePreflightError(
+            f"pip requirement file must be a local repository path: {raw_path!r}",
+            policy_id="ca9.runtime.requirements_unavailable",
+        )
+    try:
+        candidate = Path(candidate_text)
+        path = (candidate if candidate.is_absolute() else base_dir / candidate).resolve()
+    except OSError as exc:
+        raise RuntimePreflightError(
+            f"cannot resolve pip requirement file {raw_path!r}: {exc}",
+            policy_id="ca9.runtime.requirements_unavailable",
+        ) from exc
+    if not path.is_relative_to(repo_path):
+        raise RuntimePreflightError(
+            f"pip requirement file escapes the repository: {raw_path!r}",
+            policy_id="ca9.runtime.requirements_unavailable",
+        )
+    if not path.is_file():
+        raise RuntimePreflightError(
+            f"pip requirement file does not exist: {_relative_path(path, repo_path)}",
+            policy_id="ca9.runtime.requirements_unavailable",
+        )
+    return path
+
+
+def _relative_path(path: Path, repo_path: Path) -> str:
+    try:
+        return path.relative_to(repo_path).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def _logical_pip_requirement_lines(content: str) -> tuple[tuple[int, str], ...]:
+    logical_lines: list[tuple[int, str]] = []
+    buffer = ""
+    start_line = 1
+    for line_number, raw_line in enumerate(content.splitlines(), start=1):
+        stripped = raw_line.rstrip()
+        if not buffer:
+            start_line = line_number
+        if stripped.endswith("\\"):
+            buffer += stripped[:-1] + " "
+            continue
+        logical_lines.append((start_line, buffer + raw_line))
+        buffer = ""
+    if buffer:
+        logical_lines.append((start_line, buffer))
+    return tuple(logical_lines)
+
+
+def _strip_pip_requirement_comment(line: str) -> str:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return ""
+    return re.sub(r"\s+#.*$", "", stripped).strip()
+
+
+def _requirement_line_option_value(
+    tokens: tuple[str, ...],
+    *,
+    flag_name: str,
+    inline_value: str | None,
+    source_path: str,
+    line_number: int,
+) -> str:
+    expected_length = 1 if inline_value is not None else 2
+    if len(tokens) != expected_length:
+        raise RuntimePreflightError(
+            f"{flag_name} needs exactly one value in {source_path}:{line_number}",
+            policy_id="ca9.runtime.requirements_unavailable",
+        )
+    value = inline_value if inline_value is not None else tokens[1]
+    if not value:
+        raise RuntimePreflightError(
+            f"{flag_name} needs a value in {source_path}:{line_number}",
+            policy_id="ca9.runtime.requirements_unavailable",
+        )
+    return value
+
+
+def _extract_pip_hashes(
+    line: str,
+    *,
+    source_path: str,
+    line_number: int,
+) -> tuple[str, tuple[str, ...]]:
+    hashes = tuple(match.group("hash").lower() for match in _PIP_HASH_RE.finditer(line))
+    requirement_text = _PIP_HASH_RE.sub("", line).strip()
+    if "--hash" in requirement_text:
+        raise RuntimePreflightError(
+            f"invalid or unsupported pip hash in {source_path}:{line_number}",
+            policy_id="ca9.runtime.requirements_unavailable",
+        )
+    return requirement_text, hashes
+
+
+def _apply_pip_constraints(
+    requirements: list[_ParsedPipRequirement],
+    constraints: dict[str, list[Requirement]],
+) -> list[PackageRequest]:
+    requests: list[PackageRequest] = []
+    for parsed in requirements:
+        applicable_constraints = [
+            constraint
+            for constraint in constraints.get(parsed.request.name, ())
+            if _requirement_marker_applies(constraint)
+        ]
+        if not applicable_constraints:
+            requests.append(parsed.request)
+            continue
+
+        combined = [parsed.requirement, *applicable_constraints]
+        specifier_parts = [str(item.specifier) for item in combined if str(item.specifier)]
+        combined_specifier = SpecifierSet(",".join(specifier_parts))
+        exact_versions = {
+            specifier.version
+            for item in combined
+            for specifier in item.specifier
+            if specifier.operator in {"==", "==="} and "*" not in specifier.version
+        }
+        if len(exact_versions) > 1:
+            raise RuntimePreflightError(
+                f"conflicting exact constraints for pip package {parsed.request.name}",
+                policy_id="ca9.runtime.requirements_unavailable",
+            )
+        exact_version = next(iter(exact_versions), None)
+        if exact_version is not None:
+            try:
+                exact_allowed = combined_specifier.contains(exact_version, prereleases=True)
+            except (TypeError, ValueError):
+                exact_allowed = False
+            if not exact_allowed:
+                raise RuntimePreflightError(
+                    f"pip constraints exclude exact version {parsed.request.name}=={exact_version}",
+                    policy_id="ca9.runtime.requirements_unavailable",
+                )
+        requests.append(
+            replace(
+                parsed.request,
+                version_spec=str(combined_specifier) or None,
+                exact_version=exact_version,
+            )
+        )
+    return requests
+
+
+def _requirement_marker_applies(requirement: Requirement) -> bool:
+    if requirement.marker is None:
+        return True
+    try:
+        return requirement.marker.evaluate()
+    except (KeyError, TypeError, ValueError):
+        # Unknown marker environments should stay visible to policy rather than bypass it.
+        return True
+
+
+def _collect_specs(
+    args: tuple[str, ...],
+    *,
+    bool_flags: set[str],
+    flags_with_value: set[str],
+    registry_flags: set[str],
+    manager: str,
+    ecosystem: str,
+    unsupported_source_flags: set[str] | None = None,
+    require_specs: bool = True,
+) -> tuple[list[str], list[RegistrySource]]:
+    specs: list[str] = []
+    registry_sources: list[RegistrySource] = []
+    blocked_source_flags = unsupported_source_flags or set()
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            index += 1
+            continue
+        if arg in {"-r", "--requirement", "-c", "--constraint"}:
+            raise RuntimePreflightError(
+                f"{manager} requirements or constraint files are not supported by ca9 run yet"
+            )
+        if arg.startswith("-"):
+            flag_name = arg.split("=", 1)[0]
+            if flag_name in blocked_source_flags:
+                raise RuntimePreflightError(
+                    f"{manager} source option is not supported by ca9 run yet: {flag_name}"
+                )
+            if flag_name in flags_with_value:
+                value = None
+                if "=" not in arg:
+                    index += 1
+                    if index >= len(args):
+                        raise RuntimePreflightError(
+                            f"{manager} install option needs a value: {flag_name}"
+                        )
+                    value = args[index]
+                else:
+                    value = arg.split("=", 1)[1]
+                if flag_name in registry_flags:
+                    registry_sources.append(
+                        RegistrySource(
+                            ecosystem=ecosystem,
+                            kind=_registry_source_kind(manager, flag_name),
+                            url=value,
+                            option=flag_name,
+                        )
+                    )
+            elif flag_name not in bool_flags:
+                raise RuntimePreflightError(f"unsupported {manager} install option: {arg}")
+            index += 1
+            continue
+        specs.append(arg)
+        index += 1
+    if require_specs and not specs:
+        raise RuntimePreflightError(
+            f"{manager} install command did not include a direct package spec"
+        )
+    return specs, registry_sources
+
+
+def _npm_lock_requests(cwd: Path) -> tuple[list[PackageRequest], list[RegistrySource]]:
+    repo_path = cwd.resolve()
+    lock_path = repo_path / "package-lock.json"
+    if not lock_path.is_file():
+        raise RuntimePreflightError(
+            f"npm lock-backed install requires package-lock.json at {lock_path}",
+            policy_id="ca9.runtime.lockfile_unavailable",
+        )
+
+    expected_keys = _validated_external_npm_lock_keys(lock_path, repo_path)
+    inventory = read_package_lock(repo_path)
+    if inventory.warnings:
+        raise RuntimePreflightError(
+            "cannot safely preflight package-lock.json: " + "; ".join(inventory.warnings),
+            policy_id="ca9.runtime.lockfile_unavailable",
+        )
+
+    requests: list[PackageRequest] = []
+    registry_sources: list[RegistrySource] = []
+    seen_requests: set[str] = set()
+    seen_registries: set[str] = set()
+    for package in inventory.packages:
+        if package.ecosystem.lower() != "npm" or package.dependency_kind == "project":
+            continue
+        if not package.version:
+            raise RuntimePreflightError(
+                f"package-lock.json entry for {package.name} does not have an exact version",
+                policy_id="ca9.runtime.lockfile_unavailable",
+            )
+        request = PackageRequest(
+            ecosystem="npm",
+            name=package.normalized_name,
+            raw_spec=f"{package.name}@{package.version}",
+            version_spec=package.version,
+            exact_version=package.version,
+        )
+        if request.key not in expected_keys:
+            continue
+        if request.key not in seen_requests:
+            seen_requests.add(request.key)
+            requests.append(request)
+        if package.source_registry and package.source_registry not in seen_registries:
+            seen_registries.add(package.source_registry)
+            registry_sources.append(
+                RegistrySource(
+                    ecosystem="npm",
+                    kind="npm-registry",
+                    url=package.source_registry,
+                    option=f"package-lock.json:{package.name}@{package.version}",
+                )
+            )
+    missing_keys = expected_keys - seen_requests
+    if missing_keys:
+        raise RuntimePreflightError(
+            "package-lock.json entries were not represented in the package inventory: "
+            + ", ".join(sorted(missing_keys)),
+            policy_id="ca9.runtime.lockfile_unavailable",
+        )
+    return requests, registry_sources
+
+
+def _validated_external_npm_lock_keys(lock_path: Path, repo_path: Path) -> set[str]:
+    data = _load_npm_lock_data(lock_path)
+    lockfile_version = data.get("lockfileVersion")
+    if type(lockfile_version) is not int or lockfile_version not in {2, 3}:
+        rendered = repr(lockfile_version) if lockfile_version is not None else "missing"
+        raise RuntimePreflightError(
+            f"unsupported package-lock.json lockfileVersion: {rendered}; expected 2 or 3",
+            policy_id="ca9.runtime.lockfile_unavailable",
+        )
+    if "packages" not in data:
+        raise RuntimePreflightError(
+            "package-lock.json is missing the packages table",
+            policy_id="ca9.runtime.lockfile_unavailable",
+        )
+    raw_packages = data["packages"]
+    if not isinstance(raw_packages, dict):
+        raise RuntimePreflightError(
+            "package-lock.json packages table is not an object",
+            policy_id="ca9.runtime.lockfile_unavailable",
+        )
+
+    expected_keys: set[str] = set()
+    for path, entry in raw_packages.items():
+        if not isinstance(entry, dict):
+            raise RuntimePreflightError(
+                f"package-lock.json entry {path!r} is not an object",
+                policy_id="ca9.runtime.lockfile_unavailable",
+            )
+        if path == "":
+            _validate_root_lock_dependencies(entry, raw_packages)
+            continue
+        if not _safe_relative_lock_path(path):
+            raise RuntimePreflightError(
+                f"package-lock.json entry has an unsafe path: {path!r}",
+                policy_id="ca9.runtime.lockfile_unavailable",
+            )
+        if entry.get("link") is True:
+            _validate_workspace_link(path, entry, raw_packages, repo_path)
+            continue
+        if not _is_node_modules_lock_path(path):
+            # npm records workspace source packages alongside their node_modules links.
+            # These are local project code, not registry packages.
+            continue
+
+        name = _npm_lock_entry_name(path, entry)
+        version = entry.get("version")
+        if (
+            not _valid_npm_lock_name(name)
+            or not isinstance(version, str)
+            or not _is_exact_npm_version(version.strip())
+        ):
+            raise RuntimePreflightError(
+                f"package-lock.json dependency entry {path!r} is missing a name or exact version",
+                policy_id="ca9.runtime.lockfile_unavailable",
+            )
+        _validate_external_lock_source(path, entry.get("resolved"))
+        expected_keys.add(
+            PackageRequest(
+                ecosystem="npm",
+                name=name.lower(),
+                raw_spec="",
+                version_spec=version,
+                exact_version=version,
+            ).key
+        )
+    return expected_keys
+
+
+def _load_npm_lock_data(lock_path: Path) -> dict[str, Any]:
+    try:
+        with lock_path.open() as handle:
+            data = json.load(handle)
+    except OSError as exc:
+        raise RuntimePreflightError(
+            f"cannot read package-lock.json: {exc}",
+            policy_id="ca9.runtime.lockfile_unavailable",
+        ) from exc
+    except (json.JSONDecodeError, UnicodeError) as exc:
+        raise RuntimePreflightError(
+            f"cannot parse package-lock.json: {exc}",
+            policy_id="ca9.runtime.lockfile_unavailable",
+        ) from exc
+    if not isinstance(data, dict):
+        raise RuntimePreflightError(
+            "package-lock.json did not parse to an object",
+            policy_id="ca9.runtime.lockfile_unavailable",
+        )
+    return data
+
+
+def _validate_root_lock_dependencies(
+    root: dict[str, Any],
+    raw_packages: dict[str, Any],
+) -> None:
+    for field in ("dependencies", "devDependencies", "optionalDependencies"):
+        dependencies = root.get(field, {})
+        if not isinstance(dependencies, dict):
+            raise RuntimePreflightError(
+                f"package-lock.json root {field} is not an object",
+                policy_id="ca9.runtime.lockfile_unavailable",
+            )
+        for name in dependencies:
+            if not isinstance(name, str) or not name.strip():
+                raise RuntimePreflightError(
+                    f"package-lock.json root {field} contains an invalid package name",
+                    policy_id="ca9.runtime.lockfile_unavailable",
+                )
+            if f"node_modules/{name}" not in raw_packages:
+                raise RuntimePreflightError(
+                    f"package-lock.json root dependency {name!r} has no locked package entry",
+                    policy_id="ca9.runtime.lockfile_unavailable",
+                )
+
+
+def _validate_workspace_link(
+    path: str,
+    entry: dict[str, Any],
+    raw_packages: dict[str, Any],
+    repo_path: Path,
+) -> None:
+    resolved = entry.get("resolved")
+    if not isinstance(resolved, str) or not resolved.strip():
+        raise RuntimePreflightError(
+            f"package-lock.json workspace link {path!r} has no local target",
+            policy_id="ca9.runtime.lockfile_unavailable",
+        )
+    target_key = resolved.removeprefix("file:").rstrip("/")
+    if not _safe_relative_lock_path(target_key):
+        raise RuntimePreflightError(
+            f"package-lock.json workspace link {path!r} has an unsafe target",
+            policy_id="ca9.runtime.lockfile_unavailable",
+        )
+    target_path = (repo_path / target_key).resolve()
+    if not target_path.is_relative_to(repo_path) or target_key not in raw_packages:
+        raise RuntimePreflightError(
+            f"package-lock.json workspace link {path!r} has no in-repository target entry",
+            policy_id="ca9.runtime.lockfile_unavailable",
+        )
+
+
+def _validate_external_lock_source(path: str, resolved: object) -> None:
+    if resolved is None:
+        return
+    if not isinstance(resolved, str) or not resolved.strip():
+        raise RuntimePreflightError(
+            f"package-lock.json dependency entry {path!r} has an invalid resolved source",
+            policy_id="ca9.runtime.lockfile_unavailable",
+        )
+    parsed = urlparse(resolved)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        raise RuntimePreflightError(
+            f"package-lock.json dependency entry {path!r} uses an unsupported source",
+            policy_id="ca9.runtime.lockfile_unavailable",
+        )
+
+
+def _safe_relative_lock_path(path: str) -> bool:
+    if not path or "\\" in path or "\x00" in path:
+        return False
+    parsed = PurePosixPath(path)
+    return not parsed.is_absolute() and ".." not in parsed.parts
+
+
+def _is_node_modules_lock_path(path: str) -> bool:
+    return path.startswith("node_modules/") or "/node_modules/" in path
+
+
+def _npm_lock_entry_name(path: str, entry: dict[str, Any]) -> str | None:
+    raw_name = entry.get("name")
+    if isinstance(raw_name, str) and raw_name.strip():
+        return raw_name.strip()
+    segment = path.rsplit("node_modules/", 1)[-1]
+    parts = segment.split("/")
+    if parts[0].startswith("@") and len(parts) >= 2:
+        return f"{parts[0]}/{parts[1]}"
+    return parts[0] or None
+
+
+def _valid_npm_lock_name(name: str | None) -> bool:
+    if not name or name != name.strip():
+        return False
+    if name.startswith("@"):
+        parts = name.split("/")
+        return len(parts) == 2 and all(part for part in parts) and parts[0] != "@"
+    return "/" not in name
+
+
+def _registry_source_kind(manager: str, flag_name: str) -> str:
+    if manager == "npm" and flag_name == "--registry":
+        return "npm-registry"
+    if manager == "pip" and flag_name in {"--index-url", "-i"}:
+        return "pypi-index"
+    return "registry"
+
+
+def _parse_npm_spec(spec: str) -> PackageRequest:
+    if _is_direct_or_local_spec(spec):
+        raise RuntimePreflightError(f"unsupported npm direct or local package spec: {spec}")
+
+    name = spec
+    version_spec: str | None = None
+    exact_version: str | None = None
+    if spec.startswith("@"):
+        slash = spec.find("/")
+        if slash < 0:
+            raise RuntimePreflightError(f"invalid npm scoped package spec: {spec}")
+        remainder = spec[slash + 1 :]
+        at = remainder.rfind("@")
+        if at > 0:
+            name = spec[: slash + 1 + at]
+            version_spec = remainder[at + 1 :]
+    elif "@" in spec:
+        name, version_spec = spec.rsplit("@", 1)
+    if not name or "/" in name.strip("/"):
+        if not name.startswith("@"):
+            raise RuntimePreflightError(f"invalid npm package spec: {spec}")
+    if version_spec and _is_exact_npm_version(version_spec):
+        exact_version = version_spec
+    return PackageRequest(
+        ecosystem="npm",
+        name=name.lower(),
+        raw_spec=spec,
+        version_spec=version_spec,
+        exact_version=exact_version,
+    )
+
+
+def _parse_pip_spec(spec: str) -> PackageRequest:
+    return _parse_pip_requirement(spec).request
+
+
+def _parse_pip_requirement(
+    spec: str,
+    *,
+    source_path: str | None = None,
+    hashes: tuple[str, ...] = (),
+) -> _ParsedPipRequirement:
+    if _is_direct_or_local_spec(spec) or "://" in spec:
+        raise RuntimePreflightError(f"unsupported pip direct or local package spec: {spec}")
+    try:
+        requirement = Requirement(spec)
+    except InvalidRequirement as exc:
+        raise RuntimePreflightError(f"invalid pip package spec {spec!r}: {exc}") from exc
+    exact_version = None
+    version_spec = str(requirement.specifier) or None
+    exact_specs = [
+        item.version
+        for item in requirement.specifier
+        if item.operator in {"==", "==="} and "*" not in item.version
+    ]
+    if len(exact_specs) == 1 and len(list(requirement.specifier)) == 1:
+        exact_version = exact_specs[0]
+    return _ParsedPipRequirement(
+        request=PackageRequest(
+            ecosystem="pypi",
+            name=canonicalize_name(requirement.name),
+            raw_spec=spec,
+            version_spec=version_spec,
+            exact_version=exact_version,
+            source_path=source_path,
+            hashes=hashes,
+        ),
+        requirement=requirement,
+    )
+
+
+def _with_env_registry_sources(command: RuntimeCommand, env: dict[str, str]) -> RuntimeCommand:
+    sources = list(command.registry_sources)
+    if command.family == "npm":
+        sources.extend(_npm_env_registry_sources(env))
+    elif command.family == "pip":
+        sources.extend(_pip_env_registry_sources(env))
+    if tuple(sources) == command.registry_sources:
+        return command
+    return replace(command, registry_sources=tuple(sources))
+
+
+def _npm_env_registry_sources(env: dict[str, str]) -> list[RegistrySource]:
+    sources: list[RegistrySource] = []
+    seen: set[str] = set()
+    for name in NPM_REGISTRY_ENV_NAMES:
+        value = env.get(name)
+        if value:
+            seen.add(name)
+            sources.append(
+                RegistrySource(
+                    ecosystem="npm",
+                    kind="npm-registry",
+                    url=value,
+                    option=f"env:{name}",
+                )
+            )
+    for name, value in env.items():
+        lowered = name.lower()
+        if (
+            name not in seen
+            and lowered.startswith("npm_config_")
+            and lowered.endswith(":registry")
+            and value
+        ):
+            sources.append(
+                RegistrySource(
+                    ecosystem="npm",
+                    kind="npm-registry",
+                    url=value,
+                    option=f"env:{name}",
+                )
+            )
+    for name in NPM_CONFIG_FILE_ENV_NAMES:
+        value = env.get(name)
+        if value:
+            sources.append(
+                RegistrySource(
+                    ecosystem="npm",
+                    kind="npm-config-file",
+                    url=value,
+                    option=f"env:{name}",
+                )
+            )
+    return sources
+
+
+def _pip_env_registry_sources(env: dict[str, str]) -> list[RegistrySource]:
+    sources: list[RegistrySource] = []
+    for name in PIP_INDEX_ENV_NAMES:
+        value = env.get(name)
+        if value:
+            sources.append(
+                RegistrySource(
+                    ecosystem="pypi",
+                    kind="pypi-index",
+                    url=value,
+                    option=f"env:{name}",
+                )
+            )
+    for name in PIP_UNSUPPORTED_SOURCE_ENV_NAMES:
+        value = env.get(name)
+        if value:
+            sources.append(
+                RegistrySource(
+                    ecosystem="pypi",
+                    kind="pypi-unsupported-source",
+                    url=value,
+                    option=f"env:{name}",
+                )
+            )
+    for name in PIP_CONFIG_FILE_ENV_NAMES:
+        value = env.get(name)
+        if value and value != os.devnull:
+            sources.append(
+                RegistrySource(
+                    ecosystem="pypi",
+                    kind="pypi-config-file",
+                    url=value,
+                    option=f"env:{name}",
+                )
+            )
+    return sources
+
+
+def _load_feed_status_if_needed(
+    command: RuntimeCommand,
+    policy: PackagePolicy,
+    *,
+    feed_cache_dir: Path | None,
+    now: datetime | None,
+) -> FeedStatus | None:
+    if not command.package_requests:
+        return None
+    if not policy.malware.enabled and not policy.package_age.enabled:
+        return None
+    return feed_status(policy=policy, cache_dir=feed_cache_dir, now=now)
+
+
+def _feed_availability_decisions(
+    status: FeedStatus | None,
+    policy: PackagePolicy,
+) -> list[RuntimeDecision]:
+    if status is None:
+        return []
+    if status.state == "tampered":
+        return [
+            RuntimeDecision(
+                action="block",
+                policy_id="ca9.feed_unavailable",
+                reason=status.reason,
+                evidence={"state": status.state},
+            )
+        ]
+    decisions: list[RuntimeDecision] = []
+    if policy.package_age.enabled and status.state in {"missing", "stale"}:
+        decisions.append(
+            RuntimeDecision(
+                action=status.action,
+                policy_id="ca9.feed_unavailable",
+                reason=status.reason,
+                evidence={"state": status.state},
+            )
+        )
+    if (
+        policy.malware.enabled
+        and policy.malware.fail_closed
+        and status.state in {"missing", "stale"}
+    ):
+        decisions.append(
+            RuntimeDecision(
+                action="block",
+                policy_id="ca9.malware_feed_unavailable",
+                reason=f"malware policy is fail-closed and feed state is {status.state}",
+                evidence={"state": status.state},
+            )
+        )
+    return decisions
+
+
+def _registry_source_decisions(
+    command: RuntimeCommand,
+    policy: PackagePolicy,
+) -> list[RuntimeDecision]:
+    decisions: list[RuntimeDecision] = []
+    for source in command.registry_sources:
+        if source.kind in {"pypi-unsupported-source", "pypi-config-file", "npm-config-file"}:
+            decisions.append(
+                RuntimeDecision(
+                    action="block",
+                    policy_id="ca9.runtime.unsupported_source",
+                    reason=f"{source.option} is not supported by ca9 run yet",
+                    evidence=source.to_dict(),
+                )
+            )
+            continue
+        if _registry_denied(source.url, policy.registries.deny):
+            decisions.append(
+                RuntimeDecision(
+                    action=action_for_mode("block", policy.mode.default),
+                    policy_id="ca9.denied_registry",
+                    reason=f"{source.option} points to denied registry {source.url}",
+                    evidence=source.to_dict(),
+                )
+            )
+            continue
+        if policy.registries.custom_requires_approval and not _registry_allowed(
+            source.url,
+            policy.registries.allow,
+        ):
+            decisions.append(
+                RuntimeDecision(
+                    action=action_for_mode("block", policy.mode.default),
+                    policy_id="ca9.untrusted_registry",
+                    reason=f"{source.option} points to untrusted registry {source.url}",
+                    evidence=source.to_dict(),
+                )
+            )
+    return decisions
+
+
+def _malware_decisions(
+    command: RuntimeCommand,
+    policy: PackagePolicy,
+    snapshot: FeedSnapshot,
+    feed_cache_dir: Path | None,
+) -> list[RuntimeDecision]:
+    if not policy.malware.enabled:
+        return []
+    decisions: list[RuntimeDecision] = []
+    for request in command.package_requests:
+        matches = lookup_malware(
+            request.ecosystem,
+            request.name,
+            request.exact_version,
+            cache_dir=feed_cache_dir,
+            snapshot=snapshot,
+        )
+        if request.exact_version is None:
+            matches = tuple(entry for entry in matches if not entry.get("version"))
+        for entry in matches:
+            action = action_for_mode("block", policy.mode.default)
+            decisions.append(
+                RuntimeDecision(
+                    action=action,
+                    policy_id="ca9.malware",
+                    reason=str(
+                        entry.get("summary")
+                        or entry.get("id")
+                        or "local feed marks this package as malicious"
+                    ),
+                    package=request.name,
+                    version=request.exact_version,
+                    evidence={
+                        "feed_snapshot": snapshot.snapshot_id,
+                        "malware_id": entry.get("id"),
+                        "feed_version": entry.get("version"),
+                    },
+                )
+            )
+    return decisions
+
+
+def _package_age_decisions(
+    command: RuntimeCommand,
+    policy: PackagePolicy,
+    snapshot: FeedSnapshot,
+    *,
+    now: datetime | None,
+) -> list[RuntimeDecision]:
+    if not policy.package_age.enabled:
+        return []
+    active_now = now or datetime.now(timezone.utc)
+    decisions: list[RuntimeDecision] = []
+    for request in command.package_requests:
+        if _is_age_excluded(request, policy.package_age.exclusions):
+            continue
+        if request.exact_version is None:
+            if request.ecosystem == "npm":
+                continue
+            decisions.append(_unknown_release_time_decision(request, policy, snapshot))
+            continue
+        released_at = lookup_release_time(
+            request.ecosystem,
+            request.name,
+            request.exact_version,
+            snapshot=snapshot,
+        )
+        if not released_at:
+            if request.ecosystem == "npm":
+                continue
+            if release_window_covers(
+                snapshot,
+                request.ecosystem,
+                now=active_now,
+                minimum_hours=policy.package_age.minimum_hours,
+            ):
+                continue
+            decisions.append(_unknown_release_time_decision(request, policy, snapshot))
+            continue
+        released = _parse_feed_time(released_at)
+        age_hours = (active_now - released).total_seconds() / 3600
+        if age_hours >= policy.package_age.minimum_hours:
+            continue
+        action = action_for_mode("block", policy.mode.default)
+        decisions.append(
+            RuntimeDecision(
+                action=action,
+                policy_id="ca9.package_age",
+                reason=(
+                    f"package version age is {age_hours:.1f}h, below policy minimum "
+                    f"of {policy.package_age.minimum_hours}h"
+                ),
+                package=request.name,
+                version=request.exact_version,
+                evidence={
+                    "released_at": released_at,
+                    "age_hours": round(age_hours, 2),
+                    "minimum_hours": policy.package_age.minimum_hours,
+                    "feed_snapshot": snapshot.snapshot_id,
+                },
+            )
+        )
+    return decisions
+
+
+def _unknown_release_time_decision(
+    request: PackageRequest,
+    policy: PackagePolicy,
+    snapshot: FeedSnapshot,
+) -> RuntimeDecision:
+    action = action_for_mode("block", policy.mode.offline)
+    target = f"{request.name}@{request.exact_version}" if request.exact_version else request.name
+    return RuntimeDecision(
+        action=action,
+        policy_id="ca9.package_age_unknown",
+        reason=(
+            f"release time for {target} is not available in the local feed; "
+            "ca9 cannot verify the minimum package age"
+        ),
+        package=request.name,
+        version=request.exact_version,
+        evidence={
+            "feed_snapshot": snapshot.snapshot_id,
+            "minimum_hours": policy.package_age.minimum_hours,
+            "offline_mode": policy.mode.offline,
+        },
+    )
+
+
+def _secret_decision(
+    command: RuntimeCommand,
+    policy: PackagePolicy,
+    secrets: tuple[str, ...],
+) -> tuple[RuntimeDecision | None, tuple[str, ...]]:
+    if not secrets or not command.install_scripts_possible:
+        return None, ()
+    if policy.install_scripts.block_when_secrets_present:
+        action = action_for_mode("block", policy.mode.default)
+        stripped = secrets if action == "warn" and policy.ci.strip_secret_env_for_installs else ()
+        if action == "pass":
+            stripped = ()
+        if stripped:
+            action = "strip"
+        return (
+            RuntimeDecision(
+                action=action,
+                policy_id="ca9.install_scripts.secrets",
+                reason="package install may run scripts while secret-bearing environment variables are present",
+                evidence={"secret_names": list(secrets)},
+            ),
+            stripped,
+        )
+    if policy.ci.strip_secret_env_for_installs:
+        return (
+            RuntimeDecision(
+                action="strip",
+                policy_id="ca9.ci.strip_secret_env",
+                reason="secret-bearing environment variables will be stripped before package install",
+                evidence={"secret_names": list(secrets)},
+            ),
+            secrets,
+        )
+    action = action_for_mode("warn", policy.mode.default)
+    return (
+        RuntimeDecision(
+            action=action,
+            policy_id="ca9.install_scripts.secrets",
+            reason="package install may run scripts while secret-bearing environment variables are present",
+            evidence={"secret_names": list(secrets)},
+        ),
+        (),
+    )
+
+
+def _is_direct_or_local_spec(spec: str) -> bool:
+    lowered = spec.lower()
+    return (
+        lowered.startswith((".", "/", "file:", "git+", "git:", "github:", "http:", "https:"))
+        or lowered.endswith(".tgz")
+        or lowered.endswith(".whl")
+        or lowered.endswith(".zip")
+    )
+
+
+def _is_exact_npm_version(version: str) -> bool:
+    if not version:
+        return False
+    if version in {"latest", "next"}:
+        return False
+    if re.search(r"[\^~<>=*xX| ]", version):
+        return False
+    return bool(re.match(r"^[0-9][0-9A-Za-z.+-]*$", version))
+
+
+def _is_age_excluded(request: PackageRequest, exclusions: tuple[str, ...]) -> bool:
+    target = request.name.lower()
+    versioned = f"{request.ecosystem}:{target}@{request.exact_version}".lower()
+    for pattern in exclusions:
+        normalized = pattern.strip().lower()
+        if not normalized:
+            continue
+        if _glob_match(target, normalized) or _glob_match(versioned, normalized):
+            return True
+    return False
+
+
+def _glob_match(value: str, pattern: str) -> bool:
+    from fnmatch import fnmatch
+
+    return fnmatch(value, pattern)
+
+
+def _strip_option_values(command: tuple[str, ...], flags: set[str]) -> tuple[str, ...]:
+    stripped: list[str] = []
+    index = 0
+    while index < len(command):
+        arg = command[index]
+        flag_name = arg.split("=", 1)[0]
+        if flag_name in flags:
+            if "=" not in arg and index + 1 < len(command):
+                index += 2
+            else:
+                index += 1
+            continue
+        stripped.append(arg)
+        index += 1
+    return tuple(stripped)
+
+
+def _registry_allowed(registry: str, candidates: tuple[str, ...]) -> bool:
+    return _registry_matches(registry, candidates)
+
+
+def _registry_denied(registry: str, candidates: tuple[str, ...]) -> bool:
+    return _registry_matches(registry, candidates)
+
+
+def _registry_matches(registry: str, candidates: tuple[str, ...]) -> bool:
+    normalized_registry = _normalize_index_url(registry)
+    registry_host = _index_host(registry)
+    for candidate in candidates:
+        normalized_candidate = _normalize_index_url(candidate)
+        if normalized_registry == normalized_candidate:
+            return True
+        candidate_host = _index_host(candidate)
+        candidate_path = _index_path(candidate)
+        if (
+            candidate_host
+            and registry_host
+            and candidate_host == registry_host
+            and not candidate_path
+        ):
+            return True
+    return False
+
+
+def _normalize_index_url(value: str) -> str:
+    parsed = urlparse(value.strip())
+    if parsed.scheme and parsed.netloc:
+        path = parsed.path.rstrip("/")
+        return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{path}"
+    return value.strip().rstrip("/").lower()
+
+
+def _index_host(value: str) -> str:
+    raw = value.strip()
+    parsed = urlparse(raw)
+    if parsed.hostname:
+        return parsed.hostname.lower()
+    if "://" not in raw and "/" not in raw:
+        return raw.rsplit(":", 1)[0].lower()
+    return ""
+
+
+def _index_path(value: str) -> str:
+    raw = value.strip()
+    if "://" not in raw and "/" not in raw:
+        return ""
+    return urlparse(raw).path.rstrip("/")
+
+
+def _match_secret_pattern(name: str, pattern: str) -> bool:
+    if pattern.startswith("*"):
+        return name.endswith(pattern[1:])
+    if pattern.endswith("*"):
+        return name.startswith(pattern[:-1])
+    return name == pattern
+
+
+def _parse_feed_time(value: str) -> datetime:
+    normalized = value.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise FeedError(f"invalid feed release timestamp {value!r}") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")

@@ -5,6 +5,14 @@ All notable changes to ca9 will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0](https://github.com/duriantaco/ca9/compare/v0.4.0...v0.5.0) (2026-06-27)
+
+
+### Features
+
+* **supply-chain:** add package feed runtime protections ([#31](https://github.com/duriantaco/ca9/issues/31)) ([65dbdd4](https://github.com/duriantaco/ca9/commit/65dbdd4456be2c11e40668f4bc20f3864a601b21))
+* **vet:** flag workflow backdoor payloads ([#29](https://github.com/duriantaco/ca9/issues/29)) ([661b200](https://github.com/duriantaco/ca9/commit/661b200f5c7eeaece1fd7851912a1b7f3122f626))
+
 ## [0.4.0](https://github.com/duriantaco/ca9/compare/v0.3.1...v0.4.0) (2026-05-27)
 
 
@@ -29,8 +37,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ca9 protect` provides one read-only `ca9.protect.v1` posture report for
+  package-manager enforcement coverage, feed state, expiring exceptions,
+  package-policy decisions, and local GitHub Actions trust boundaries, with
+  table, JSON, Markdown, and SARIF output. The composite GitHub Action now
+  supports `command: protect`.
+- Runtime preflight now supports local pip `-r` requirements and `-c`
+  constraints, including nested repository-bound includes, markers, exact
+  constraints, and strong hash evidence. Unsafe sources, cycles, escaping
+  paths, and gateway-bypass argument forms fail closed.
+- Package policy now supports scoped `[[exceptions]]` with required owner,
+  reason, and expiry. Applied exceptions are recorded by `vet`, preflight, and
+  npm/PyPI gateways; known-malware decisions remain non-overridable.
+- `ca9 scripts audit` (for npm v12, `latest`/GA July 8, 2026) strictly audits every script-bearing npm v2/v3 lockfile occurrence, including non-registry `prepare` hooks, while excluding workspaces and keeping external file sources in review. Malformed or unmaterializable entries hard-error; registry and command identity comes from trusted lock-source evidence. v1 is deny/review-oriented: even hash-verified native-build shapes remain review until executable/GYP provenance is established. Its command emitter requires an exact installed-tree match and trusted identity/version, uses `--allow-scripts-pin` for approvals, and otherwise emits POSIX/PowerShell-compatible comments instead of commands.
+
+- Lockfile-backed runtime preflight for `npm ci` and its clean-install aliases, including direct and transitive package policy checks before npm starts.
+- Native Grype and OSV-Scanner JSON report parsers with auto-detection, advisory metadata, mixed-ecosystem handling, fixtures, and integration documentation.
 - `ca9 vet --malware-query` now treats explicit malicious-package advisories and malware-labeled GHSA/OSV records as blocking malware findings, including npm packages.
 - `ca9 vet --scan-workflows` scans GitHub Actions workflow files for risky `pull_request_target`, OIDC token, broad write-permission, mutable action-ref, cache trust-boundary, and source-clone patterns.
+
+### Changed
+
+- Unknown and non-Python scanner findings remain explicitly inconclusive instead of receiving Python reachability reasoning, and OSV multi-interval affected ranges are preserved.
 
 ## [0.3.0] - 2026-05-13
 
