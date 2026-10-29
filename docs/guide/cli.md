@@ -7,7 +7,8 @@ description: Complete ca9 CLI reference for Python CVE reachability analysis, pa
 
 ca9 provides reachability-aware CVE triage and local package security checks. The core
 commands are `check` for existing SCA reports, `scan` for direct OSV.dev scanning,
-`inventory` for normalized package evidence, `vet` for supply-chain risk checks, `feed`
+`inventory` for normalized package evidence, `review` for npm dependency updates,
+`vet` for supply-chain risk checks, `feed`
 for local package-intelligence snapshots, `run` for supported npm/pip install
 preflight, and `ingest-sarif` for normalizing static-analysis evidence from other tools.
 
@@ -167,6 +168,32 @@ ca9 protect --repo . -f sarif -o ca9-protect.sarif
 ca9 protect --repo . --no-scan-workflows
 ```
 
+## `ca9 review`
+
+Compare npm v2/v3 lockfiles and hash-verified release artifacts without executing
+package code.
+
+```bash
+ca9 review --base FILE --head FILE [OPTIONS]
+```
+
+| Option | Description |
+|---|---|
+| `--base FILE` | Required base `package-lock.json` file. |
+| `--head FILE` | Required updated `package-lock.json` file. |
+| `-f, --format json\|markdown` | Output format. Defaults to `markdown`. |
+| `-o, --output PATH` | Write the report to a file. |
+| `--cache-dir PATH` | Artifact cache directory. |
+| `--trusted-registry HTTPS_ORIGIN` | Add an explicitly trusted artifact origin; repeatable. The npm registry remains trusted. |
+| `--no-scan-artifacts` | Compare lock metadata without artifact downloads; changed behavior remains incomplete. |
+
+The report keeps installed occurrences and dependency chains, compares lifecycle
+and entry-point declarations and supported static observations, and marks gaps
+explicitly. Exits `0` for a complete pass, `1` for a complete review or any block,
+and `2` for incomplete evidence or invalid input. This is a bounded update review,
+not a package-safety or behavioral-equivalence verdict. See
+[Dependency Update Review](dependency-review.md) for examples and scope.
+
 ## `ca9 vet`
 
 Run package supply-chain risk checks.
@@ -187,13 +214,14 @@ Options:
 | `--private-index URL` | Private package index allowed for internal package names. Can be repeated. |
 | `--internal-package PATTERN` | Internal package name or glob pattern, e.g. `acme-*`. Can be repeated. |
 | `--malware-query` | Query OSV for known malicious-package advisories. |
+| `--scan-publisher-changes` | Query public npm metadata for recent publisher changes after release dormancy in direct, locked dependencies. |
 | `--scan-artifacts` | Hash-verify, unpack, and statically inspect package artifacts. |
 | `--scan-workflows` | Scan GitHub Actions workflows for risky token, OIDC, and trust-boundary patterns. |
 | `--allow-unhashed-downloads` | Allow artifact scanning when the lockfile has no artifact hash. |
 | `--max-artifact-mb N` | Maximum artifact download size for `--scan-artifacts`. Defaults to `100`. |
 | `--deny-license ID` | Denied license identifier. Can be repeated. |
 | `--require-known-license` | Warn when scanned artifact metadata has no known license. |
-| `--offline` | Use cached OSV data only for `--malware-query`. |
+| `--offline` | Use cached OSV data only for `--malware-query`; incompatible with `--scan-publisher-changes`. |
 | `--refresh-cache` | Clear OSV cache before `--malware-query`. |
 | `--max-osv-workers N` | Maximum concurrent OSV detail fetches. Defaults to `8`. |
 
@@ -202,6 +230,7 @@ Examples:
 ```bash
 ca9 vet --repo .
 ca9 vet --repo . --scan-artifacts
+ca9 vet --repo . --scan-publisher-changes
 ca9 vet --repo . --scan-workflows
 ca9 vet --repo . --malware-query --offline
 ca9 vet --repo . --internal-package 'acme-*' --private-index https://packages.acme.internal/simple
@@ -483,3 +512,6 @@ ca9 enrich-sbom sbom.json --repo . --coverage coverage.json -o sbom.ca9.json
 | `2` | Only inconclusive findings remain, or a capability/action policy produced a blocking decision. |
 
 Input errors such as invalid JSON, missing files, or unsupported formats also return a non-zero exit code with a Click error message.
+
+`ca9 review` uses its own comparison decisions: `0` for a complete pass, `1` for
+a complete review or any block, and `2` for incomplete evidence or invalid input.

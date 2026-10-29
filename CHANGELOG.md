@@ -5,6 +5,17 @@ All notable changes to ca9 will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0](https://github.com/duriantaco/ca9/compare/v0.5.0...v0.6.0) (2026-09-26)
+
+
+### Features
+
+* **supply-chain:** add npm ci enforcement and scanner integrations ([#32](https://github.com/duriantaco/ca9/issues/32)) ([8872537](https://github.com/duriantaco/ca9/commit/8872537f7c1428dec31a26d559bbda433807a021))
+* **supply-chain:** add npm lifecycle script auditing ([#34](https://github.com/duriantaco/ca9/issues/34)) ([2f3c7be](https://github.com/duriantaco/ca9/commit/2f3c7be32029bca809a2a279807ae9b60cbebb44))
+* **supply-chain:** add secure install control plane ([#35](https://github.com/duriantaco/ca9/issues/35)) ([31171cd](https://github.com/duriantaco/ca9/commit/31171cd57a6d0cec756addcbbb71d18ad30af1cb))
+* **supply-chain:** review npm dependency updates and strengthen evidence gates ([#36](https://github.com/duriantaco/ca9/issues/36)) ([b199512](https://github.com/duriantaco/ca9/commit/b199512e168949c0c9bfeb3233191bf2f129ebd9))
+* **vet:** review dormant npm publisher handovers ([#37](https://github.com/duriantaco/ca9/issues/37)) ([a494cda](https://github.com/duriantaco/ca9/commit/a494cda3866cb0b0468f9251408eeb5c86683110))
+
 ## [0.5.0](https://github.com/duriantaco/ca9/compare/v0.4.0...v0.5.0) (2026-06-27)
 
 
@@ -35,8 +46,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Coverage verdicts preserve valid execution despite malformed ancillary metadata
+  and consider positive execution before static import absence. Production
+  observations prevent unsupported absence-based suppressions.
+- Dependency review retains structural lock errors, inspects known nested and
+  lifecycle executable targets, and compares npm module format, directory bins,
+  implicit native install hooks, and default entrypoints. Manifest declarations
+  remain comparable independently of executable inspection gaps. Report URL
+  redaction preserves the identity of hidden changes.
+- The npm metadata gateway revalidates required feed evidence for each metadata
+  response and reports a blocking evaluation failure instead of silently
+  forwarding metadata when configured policy requires blocking.
+
 ### Added
 
+- `ca9 vet --scan-publisher-changes` optionally reviews direct npm lockfile
+  dependencies for recent publisher handovers after long release gaps using
+  public npm metadata. It emits review warnings tied to the locked version.
+- `ca9 review --base FILE --head FILE` compares npm v2/v3 dependency updates
+  using lockfile occurrence identity, verified release artifacts, lifecycle and
+  entry-point declarations, and stable static observations. Markdown and JSON
+  reports distinguish new changes from existing findings and keep incomplete
+  artifact comparisons explicit.
 - `ca9 protect` provides one read-only `ca9.protect.v1` posture report for
   package-manager enforcement coverage, feed state, expiring exceptions,
   package-policy decisions, and local GitHub Actions trust boundaries, with
@@ -59,6 +92,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Unknown and non-Python scanner findings remain explicitly inconclusive instead of receiving Python reachability reasoning, and OSV multi-interval affected ranges are preserved.
+- Coverage evidence now distinguishes reported statements from missing, partial, empty, or excluded-only affected scope. Strict mode keeps test non-execution inconclusive regardless of overall coverage percentage; balanced dynamic verdicts require explicit statement evidence. OpenVEX exports dynamic verdicts as `under_investigation` rather than `not_affected`.
 
 ## [0.3.0] - 2026-05-13
 

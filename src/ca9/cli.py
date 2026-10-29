@@ -20,6 +20,7 @@ from ca9.models import Report
 from ca9.parsers import detect_parser
 from ca9.policy import apply_policy
 from ca9.report import write_html, write_json, write_markdown, write_sarif, write_table
+from ca9.review.cli import review_cmd
 from ca9.vex import write_openvex
 
 
@@ -651,7 +652,12 @@ def run_cmd(
             ) as gateway:
                 completed = subprocess.run(
                     list(gateway_child_command(preflight.command)),
-                    env=npm_gateway_child_env(child_env, gateway.registry_url),
+                    env=npm_gateway_child_env(
+                        child_env,
+                        gateway.registry_url,
+                        user_config_path=gateway.user_config_path,
+                        global_config_path=gateway.global_config_path,
+                    ),
                 )
                 gateway_events = _gateway_ledger_events(gateway.to_dict(), session_id=session_id)
         elif should_start_pypi_gateway(preflight.command.family, package_policy, preflight.feed):
@@ -722,7 +728,7 @@ def _gateway_ledger_events(gateway_payload: dict[str, Any], *, session_id: str):
     from ca9.runtime.preflight import LedgerEvent
 
     events = [LedgerEvent("gateway_used", gateway_payload, session_id)]
-    for key in ("removed_versions", "removed_links"):
+    for key in ("removed_versions", "removed_links", "evaluation_failures"):
         for decision in gateway_payload.get(key) or []:
             payload = {"action": "block", **decision}
             events.append(LedgerEvent("decision_emitted", payload, session_id))
@@ -942,6 +948,12 @@ def protect_cmd(
     help="Query OSV for known malicious package advisories.",
 )
 @click.option(
+    "--scan-publisher-changes",
+    is_flag=True,
+    default=False,
+    help="Query public npm metadata for recent publisher changes after release dormancy.",
+)
+@click.option(
     "--scan-artifacts",
     is_flag=True,
     default=False,
@@ -982,7 +994,7 @@ def protect_cmd(
     "--offline",
     is_flag=True,
     default=False,
-    help="Use only cached OSV data for --malware-query.",
+    help="Use cached OSV data for --malware-query; cannot scan publisher changes.",
 )
 @click.option(
     "--refresh-cache",
@@ -1008,6 +1020,7 @@ def vet_cmd(
     private_indexes: tuple[str, ...],
     internal_package_patterns: tuple[str, ...],
     malware_query: bool,
+    scan_publisher_changes: bool,
     scan_artifacts: bool,
     scan_workflows: bool,
     allow_unhashed_downloads: bool,
@@ -1044,6 +1057,18 @@ def vet_cmd(
         raise click.ClickException(str(exc)) from None
 
     inventory = build_inventory(repo_path)
+    if offline and scan_publisher_changes:
+        raise click.ClickException(
+            "--scan-publisher-changes requires npm registry access; remove --offline"
+        )
+
+    publisher_findings = []
+    publisher_warnings = []
+    if scan_publisher_changes:
+        from ca9.npm_publisher import scan_npm_publisher_changes
+
+        publisher_findings, publisher_warnings = scan_npm_publisher_changes(inventory.packages)
+
     policy_findings = []
     feed_warnings = []
     if package_policy.package_age.enabled:
@@ -1101,7 +1126,7 @@ def vet_cmd(
                 raise click.ClickException(str(e)) from None
 
     artifact_findings = []
-    artifact_warnings = [*policy_warnings, *feed_warnings]
+    artifact_warnings = [*policy_warnings, *feed_warnings, *publisher_warnings]
     artifact_scans = 0
     skipped_artifacts = 0
     workflow_findings = []
@@ -1126,7 +1151,12 @@ def vet_cmd(
             require_known_license=require_known_license,
         )
         artifact_findings.extend(analyze_license_policy(artifact_result.snapshots, license_policy))
-        artifact_warnings = [*policy_warnings, *feed_warnings, *artifact_result.warnings]
+        artifact_warnings = [
+            *policy_warnings,
+            *feed_warnings,
+            *publisher_warnings,
+            *artifact_result.warnings,
+        ]
         artifact_scans = artifact_result.scanned_artifacts
         skipped_artifacts = artifact_result.skipped_artifacts
 
@@ -1151,7 +1181,12 @@ def vet_cmd(
         inventory,
         policy=policy,
         malware_advisories=malware_advisories,
-        extra_findings=[*policy_findings, *artifact_findings, *workflow_findings],
+        extra_findings=[
+            *policy_findings,
+            *publisher_findings,
+            *artifact_findings,
+            *workflow_findings,
+        ],
         extra_warnings=artifact_warnings,
         artifact_scans=artifact_scans,
         skipped_artifacts=skipped_artifacts,
@@ -2392,6 +2427,9 @@ def enrich_sbom_cmd(
         click.echo(f"Enriched SBOM written to {output_path}", err=True)
     else:
         click.echo(text)
+
+
+main.add_command(review_cmd)
 
 
 if __name__ == "__main__":
