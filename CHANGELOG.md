@@ -5,6 +5,39 @@ All notable changes to ca9 will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0](https://github.com/duriantaco/ca9/compare/v0.8.0...v0.9.0) (2026-11-10)
+
+
+### Features
+
+* **threat-intel:** add bounded dated EPSS and KEV observations ([#47](https://github.com/duriantaco/ca9/issues/47)) ([7b388e4](https://github.com/duriantaco/ca9/commit/7b388e479694e53210096eaa79eacae5c460ff29))
+
+## [0.8.0](https://github.com/duriantaco/ca9/compare/v0.7.1...v0.8.0) (2026-11-09)
+
+
+### Features
+
+* supply-chain v4 detection and early-warning sentinel ([#45](https://github.com/duriantaco/ca9/issues/45)) ([479708f](https://github.com/duriantaco/ca9/commit/479708ff27b92eeeb0bc4bfa04c3a2d0c2c27c2a))
+
+## [0.7.1](https://github.com/duriantaco/ca9/compare/v0.7.0...v0.7.1) (2026-11-08)
+
+
+### Bug Fixes
+
+* **engine:** let a located vulnerable call outweigh the submodule guess ([#43](https://github.com/duriantaco/ca9/issues/43)) ([091960f](https://github.com/duriantaco/ca9/commit/091960f875f8ab518584a76fccb35952070057fe))
+
+## [0.7.0](https://github.com/duriantaco/ca9/compare/v0.6.0...v0.7.0) (2026-11-07)
+
+
+### Features
+
+* **supply-chain:** detect range-only malware, review upgrades and audit agent and CI configs ([be1eb6a](https://github.com/duriantaco/ca9/commit/be1eb6a3aa6d347541b81e13c8407cc16acaedac))
+
+
+### Bug Fixes
+
+* **release:** support core metadata 2.5 uploads ([#38](https://github.com/duriantaco/ca9/issues/38)) ([e9cd206](https://github.com/duriantaco/ca9/commit/e9cd206c4d0000c4b213ef976f8c138e55748f25))
+
 ## [0.6.0](https://github.com/duriantaco/ca9/compare/v0.5.0...v0.6.0) (2026-09-26)
 
 
